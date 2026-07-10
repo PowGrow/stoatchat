@@ -59,6 +59,32 @@ jobs:
             ghcr.io/powgrow/stoat-api:latest
             ghcr.io/powgrow/stoat-api:${{ github.sha }}
 
+      - name: Build bonfire image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/bonfire/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=ghcr.io/powgrow/stoat-base:latest
+          tags: |
+            ghcr.io/powgrow/stoat-bonfire:latest
+            ghcr.io/powgrow/stoat-bonfire:${{ github.sha }}
+
+      - name: Build autumn image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/services/autumn/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=ghcr.io/powgrow/stoat-base:latest
+          tags: |
+            ghcr.io/powgrow/stoat-autumn:latest
+            ghcr.io/powgrow/stoat-autumn:${{ github.sha }}
+
       - name: Build voice-ingress image
         uses: docker/build-push-action@v6
         with:
