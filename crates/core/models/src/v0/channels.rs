@@ -315,6 +315,12 @@ auto_derived!(
         pub recipients: Option<Vec<String>>,
     }
 
+    /// Set your own voice state in a voice channel
+    pub struct DataSetVoiceState {
+        /// Whether you are receiving audio (false while deafened)
+        pub is_receiving: Option<bool>,
+    }
+
     pub struct ChannelSlowmode {
         pub channel_id: String,
         pub duration: u64,
