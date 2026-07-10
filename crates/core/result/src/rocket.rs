@@ -56,6 +56,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::TooManyServers { .. } => Status::BadRequest,
             ErrorType::TooManyEmbeds { .. } => Status::BadRequest,
             ErrorType::TooManyEmoji { .. } => Status::BadRequest,
+            ErrorType::TooManySounds { .. } => Status::BadRequest,
             ErrorType::TooManyChannels { .. } => Status::BadRequest,
             ErrorType::TooManyRoles { .. } => Status::BadRequest,
 
@@ -95,6 +96,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::ProxyError => Status::BadRequest,
             ErrorType::FileTooSmall => Status::UnprocessableEntity,
             ErrorType::FileTooLarge { .. } => Status::UnprocessableEntity,
+            ErrorType::FileDurationTooLong { .. } => Status::UnprocessableEntity,
             ErrorType::FileTypeNotAllowed => Status::BadRequest,
             ErrorType::ImageProcessingFailed => Status::InternalServerError,
             ErrorType::NoEmbedData => Status::BadRequest,

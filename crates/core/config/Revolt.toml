@@ -224,6 +224,7 @@ message_embeds = 5
 message_replies = 5
 message_reactions = 20
 server_emoji = 100
+server_sounds = 50
 server_roles = 200
 server_channels = 200
 
@@ -276,6 +277,7 @@ backgrounds = 6_000_000
 icons = 2_500_000
 banners = 6_000_000
 emojis = 500_000
+sounds = 5_000_000
 
 [features.limits.default]
 # Limits imposed on users by default
@@ -315,6 +317,7 @@ backgrounds = 6_000_000
 icons = 2_500_000
 banners = 6_000_000
 emojis = 500_000
+sounds = 5_000_000
 
 [features.advanced]
 # The max amount of messages the rabbitmq provider/db mention adder job will delay for before forcing handling of a channel.

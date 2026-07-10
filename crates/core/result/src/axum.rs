@@ -49,6 +49,7 @@ impl IntoResponse for Error {
             ErrorType::TooManyServers { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyEmbeds { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyEmoji { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::TooManySounds { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyChannels { .. } => StatusCode::BAD_REQUEST,
             ErrorType::TooManyRoles { .. } => StatusCode::BAD_REQUEST,
 
@@ -90,6 +91,7 @@ impl IntoResponse for Error {
             ErrorType::ProxyError => StatusCode::BAD_REQUEST,
             ErrorType::FileTooSmall => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorType::FileTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorType::FileDurationTooLong { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ErrorType::FileTypeNotAllowed => StatusCode::BAD_REQUEST,
             ErrorType::ImageProcessingFailed => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorType::NoEmbedData => StatusCode::BAD_REQUEST,

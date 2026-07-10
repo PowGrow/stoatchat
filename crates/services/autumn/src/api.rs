@@ -129,7 +129,12 @@ pub enum Tag {
     icons,
     banners,
     emojis,
+    sounds,
 }
+
+/// Maximum duration of a soundboard sound in seconds
+/// (5s limit + 0.5s slack for container timestamp imprecision)
+const MAX_SOUND_DURATION_SECONDS: f64 = 5.5;
 
 /// Request body for upload
 #[derive(ToSchema, TryFromMultipart)]
@@ -159,6 +164,7 @@ pub struct UploadResponse {
 /// | icons | 2.5 MB | 40 MP or 10,000px | Image |
 /// | banners | 6 MB | 40 MP or 10,000px | Image |
 /// | emojis | 500 KB | 40 MP or 10,000px | Image |
+/// | sounds | 5 MB | up to 5 seconds | Audio |
 #[utoipa::path(
     post,
     path = "/{tag}",
@@ -220,7 +226,7 @@ async fn upload_file(
     };
 
     // Generate an ID for this file
-    let id = if matches!(tag, Tag::emojis) {
+    let id = if matches!(tag, Tag::emojis | Tag::sounds) {
         ulid::Ulid::new().to_string()
     } else {
         nanoid::nanoid!(42)
@@ -242,8 +248,25 @@ async fn upload_file(
     // Determine metadata for the file
     let metadata = generate_metadata(&file.contents, mime_type);
 
-    // Block non-images for non-attachment uploads
-    if !matches!(tag, Tag::attachments) && !matches!(metadata, Metadata::Image { .. }) {
+    // Soundboard uploads must be audio files within the duration limit,
+    // all other non-attachment uploads must be images
+    if matches!(tag, Tag::sounds) {
+        if !matches!(metadata, Metadata::Audio) {
+            return Err(create_error!(FileTypeNotAllowed));
+        }
+
+        let duration = ffprobe::ffprobe(file.contents.path())
+            .ok()
+            .and_then(|data| data.format.duration)
+            .and_then(|duration| duration.parse::<f64>().ok())
+            .ok_or_else(|| create_error!(FileTypeNotAllowed))?;
+
+        if duration > MAX_SOUND_DURATION_SECONDS {
+            return Err(create_error!(FileDurationTooLong {
+                max_seconds: MAX_SOUND_DURATION_SECONDS as usize
+            }));
+        }
+    } else if !matches!(tag, Tag::attachments) && !matches!(metadata, Metadata::Image { .. }) {
         return Err(create_error!(FileTypeNotAllowed));
     }
 

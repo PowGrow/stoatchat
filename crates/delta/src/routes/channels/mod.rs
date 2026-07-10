@@ -24,6 +24,7 @@ mod message_unpin;
 mod message_unreact;
 mod permissions_set;
 mod permissions_set_default;
+mod sound_play;
 mod voice_join;
 mod voice_state_set;
 mod voice_stop_ring;
@@ -50,6 +51,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         group_create::create_group,
         group_add_member::add_member,
         group_remove_member::remove_member,
+        sound_play::play_sound,
         voice_join::call,
         voice_state_set::set_voice_state,
         voice_stop_ring::stop_ring,

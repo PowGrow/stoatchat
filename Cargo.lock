@@ -7649,6 +7649,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tokio 1.51.0",
  "ulid 1.2.1",
  "unicode-segmentation",
  "url-escape",

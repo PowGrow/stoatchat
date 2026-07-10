@@ -24,6 +24,7 @@ mod server_create;
 mod server_delete;
 mod server_edit;
 mod server_fetch;
+mod sound_list;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
@@ -49,6 +50,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         permissions_set::set_role_permission,
         permissions_set_default::set_default_server_permissions,
         emoji_list::list_emoji,
+        sound_list::list_sounds,
         roles_edit_positions::edit_role_ranks
     ]
 }

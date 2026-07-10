@@ -118,6 +118,9 @@ pub enum ErrorType {
     TooManyEmoji {
         max: usize,
     },
+    TooManySounds {
+        max: usize,
+    },
     TooManyRoles {
         max: usize,
     },
@@ -176,6 +179,9 @@ pub enum ErrorType {
     FileTooSmall,
     FileTooLarge {
         max: usize,
+    },
+    FileDurationTooLong {
+        max_seconds: usize,
     },
     FileTypeNotAllowed,
     ImageProcessingFailed,

@@ -15,6 +15,7 @@ mod safety_snapshots;
 mod server_bans;
 mod server_members;
 mod servers;
+mod sounds;
 mod user_settings;
 mod users;
 
@@ -35,6 +36,7 @@ pub use safety_snapshots::*;
 pub use server_bans::*;
 pub use server_members::*;
 pub use servers::*;
+pub use sounds::*;
 pub use user_settings::*;
 pub use users::*;
 
@@ -63,6 +65,7 @@ pub trait AbstractDatabase:
     + server_bans::AbstractServerBans
     + server_members::AbstractServerMembers
     + servers::AbstractServers
+    + sounds::AbstractSounds
     + user_settings::AbstractUserSettings
     + users::AbstractUsers
 {

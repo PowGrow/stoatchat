@@ -240,6 +240,23 @@ impl State {
             None
         };
 
+        let sounds = if fields.sounds {
+            Some(
+                db.fetch_sounds_by_parent_ids(
+                    &servers
+                        .iter()
+                        .map(|x| x.id.to_string())
+                        .collect::<Vec<String>>(),
+                )
+                .await?
+                .into_iter()
+                .map(|sound| sound.into())
+                .collect(),
+            )
+        } else {
+            None
+        };
+
         // Fetch user settings
         let user_settings = if !fields.user_settings.is_empty() {
             Some(
@@ -324,6 +341,7 @@ impl State {
             voice_states,
 
             emojis,
+            sounds,
             user_settings,
             channel_unreads,
 
@@ -520,6 +538,7 @@ impl State {
                 server,
                 channels,
                 emojis: _,
+                sounds: _,
                 voice_states: _,
             } => {
                 self.insert_subscription(id.clone()).await;

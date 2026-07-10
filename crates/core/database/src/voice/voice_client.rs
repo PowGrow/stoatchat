@@ -5,7 +5,10 @@ use crate::{
 };
 use livekit_api::{
     access_token::{AccessToken, VideoGrants},
-    services::room::{CreateRoomOptions, RoomClient as InnerRoomClient, UpdateParticipantOptions},
+    services::room::{
+        CreateRoomOptions, RoomClient as InnerRoomClient, SendDataOptions,
+        UpdateParticipantOptions,
+    },
 };
 use livekit_protocol::{ParticipantInfo, ParticipantPermission, Room};
 use revolt_config::{config, LiveKitNode};
@@ -140,6 +143,43 @@ impl VoiceClient {
             )
             .await
             .to_internal_error()
+    }
+
+    /// Send a data message to all participants of a room (e.g. soundboard play notifications)
+    ///
+    /// livekit-api's send_data future is not Send (it holds a thread-local RNG across an
+    /// await point), so it cannot be polled inside a Rocket handler directly — run it to
+    /// completion on a blocking thread instead.
+    pub async fn send_data(
+        &self,
+        node: &str,
+        channel_id: &str,
+        topic: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let node = self.get_node(node)?.node.clone();
+        let channel_id = channel_id.to_string();
+        let topic = topic.to_string();
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(async move {
+                InnerRoomClient::with_api_key(&node.url, &node.key, &node.secret)
+                    .send_data(
+                        &channel_id,
+                        data,
+                        SendDataOptions {
+                            kind: livekit_protocol::data_packet::Kind::Reliable,
+                            topic: Some(topic),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        })
+        .await
+        .to_internal_error()?
+        .to_internal_error()
     }
 
     pub async fn remove_user(&self, node: &str, user_id: &str, channel_id: &str) -> Result<()> {
