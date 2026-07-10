@@ -6,8 +6,8 @@ use revolt_database::{
     util::reference::Reference,
     voice::{
         create_voice_state, delete_channel_voice_state, delete_voice_state,
-        get_user_moved_from_voice, get_user_moved_to_voice, update_voice_state_tracks,
-        RoomMetadata, UserVoiceChannel, VoiceClient,
+        get_user_moved_from_voice, get_user_moved_to_voice, get_voice_channel_members,
+        update_voice_state_tracks, RoomMetadata, UserVoiceChannel, VoiceClient,
     },
     Database, AMQP,
 };
@@ -16,6 +16,24 @@ use rocket::{post, State};
 use rocket_empty::EmptyResponse;
 
 use crate::guard::AuthHeader;
+
+/// The server id normally comes from room metadata, but some webhook events
+/// (track_*) carry the room without metadata — fall back to the database.
+async fn resolve_server_id(
+    db: &Database,
+    channel_id: &str,
+    room_metadata: &Option<RoomMetadata>,
+) -> Result<Option<String>> {
+    Ok(if let Some(metadata) = room_metadata {
+        metadata.server.clone()
+    } else {
+        Reference::from_unchecked(channel_id)
+            .as_channel(db)
+            .await?
+            .server()
+            .map(ToString::to_string)
+    })
+}
 
 #[post("/<node>", data = "<body>")]
 pub async fn ingress(
@@ -51,8 +69,15 @@ pub async fn ingress(
 
     let channel_id = event.room.as_ref().map(|r| &r.name);
     let user_id = event.participant.as_ref().map(|r| &r.identity);
+    // track_* events carry the room object without metadata: parsing the
+    // empty string used to 500 here, LiveKit then retried the webhook and the
+    // retries aged out participant_left events in the delivery queue.
     let room_metadata = if let Some(room) = event.room.as_ref() {
-        Some(serde_json::from_str::<RoomMetadata>(&room.metadata).to_internal_error()?)
+        if room.metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str::<RoomMetadata>(&room.metadata).to_internal_error()?)
+        }
     } else {
         None
     };
@@ -62,7 +87,7 @@ pub async fn ingress(
         "participant_joined" => {
             let channel_id = channel_id.to_internal_error()?;
             let user_id = user_id.to_internal_error()?;
-            let server_id = room_metadata.to_internal_error()?.server;
+            let server_id = resolve_server_id(db, channel_id, &room_metadata).await?;
             let channel = UserVoiceChannel {
                 id: channel_id.clone(),
                 server_id: server_id.clone(),
@@ -143,7 +168,7 @@ pub async fn ingress(
         "participant_left" => {
             let channel_id = channel_id.to_internal_error()?;
             let user_id = user_id.to_internal_error()?;
-            let server_id = room_metadata.to_internal_error()?.server;
+            let server_id = resolve_server_id(db, channel_id, &room_metadata).await?;
             let channel = UserVoiceChannel {
                 id: channel_id.clone(),
                 server_id: server_id.clone(),
@@ -213,7 +238,7 @@ pub async fn ingress(
             let channel_id = channel_id.to_internal_error()?;
             let user_id = user_id.to_internal_error()?;
             let track = event.track.as_ref().to_internal_error()?;
-            let server_id = room_metadata.to_internal_error()?.server;
+            let server_id = resolve_server_id(db, channel_id, &room_metadata).await?;
             let channel = UserVoiceChannel {
                 id: channel_id.clone(),
                 server_id: server_id.clone(),
@@ -281,13 +306,29 @@ pub async fn ingress(
         }
         "room_finished" => {
             let channel_id = channel_id.to_internal_error()?;
-            let server_id = room_metadata.to_internal_error()?.server;
+            let server_id = resolve_server_id(db, channel_id, &room_metadata).await?;
             let channel = UserVoiceChannel {
                 id: channel_id.clone(),
                 server_id: server_id.clone(),
             };
 
-            delete_channel_voice_state(&channel, &[]).await?;
+            let members = get_voice_channel_members(&channel)
+                .await?
+                .unwrap_or_default();
+
+            delete_channel_voice_state(&channel, &members).await?;
+
+            // participant_left webhooks can be dropped by LiveKit's delivery
+            // queue ("reason: age"): sync the leave to clients here so ghost
+            // participants don't linger until a reload.
+            for user_id in members {
+                EventV1::VoiceChannelLeave {
+                    id: channel_id.clone(),
+                    user: user_id,
+                }
+                .p(channel_id.clone())
+                .await;
+            }
         }
         _ => {}
     };

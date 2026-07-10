@@ -58,3 +58,16 @@ jobs:
           tags: |
             ghcr.io/powgrow/stoat-api:latest
             ghcr.io/powgrow/stoat-api:${{ github.sha }}
+
+      - name: Build voice-ingress image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/daemons/voice-ingress/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=ghcr.io/powgrow/stoat-base:latest
+          tags: |
+            ghcr.io/powgrow/stoat-voice-ingress:latest
+            ghcr.io/powgrow/stoat-voice-ingress:${{ github.sha }}
