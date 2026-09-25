@@ -31,6 +31,9 @@ auto_derived_partial!(
         #[serde(skip_serializing_if = "Option::is_none")]
         /// Avatar attachment
         pub avatar: Option<File>,
+        /// Name colour (solid or gradient CSS)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub name_colour: Option<String>,
         /// Relationships with other users
         #[serde(skip_serializing_if = "Option::is_none")]
         pub relations: Option<Vec<Relationship>>,
@@ -73,6 +76,7 @@ auto_derived!(
         ProfileContent,
         ProfileBackground,
         DisplayName,
+        NameColour,
 
         // internal fields
         Suspension,
@@ -180,6 +184,7 @@ impl Default for User {
             discriminator: Default::default(),
             display_name: Default::default(),
             avatar: Default::default(),
+            name_colour: Default::default(),
             relations: Default::default(),
             badges: Default::default(),
             status: Default::default(),
@@ -703,6 +708,7 @@ impl User {
                 }
             }
             FieldsUser::DisplayName => self.display_name = None,
+            FieldsUser::NameColour => self.name_colour = None,
             FieldsUser::Suspension => self.suspended_until = None,
             FieldsUser::None => {}
         }
@@ -818,6 +824,7 @@ impl User {
                 FieldsUser::StatusPresence,
                 FieldsUser::ProfileContent,
                 FieldsUser::ProfileBackground,
+                FieldsUser::NameColour,
                 FieldsUser::Suspension,
             ],
         )

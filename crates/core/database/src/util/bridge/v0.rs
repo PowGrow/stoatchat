@@ -1064,6 +1064,7 @@ impl crate::User {
             discriminator: self.discriminator,
             display_name: self.display_name,
             avatar: self.avatar.map(|file| file.into()),
+            name_colour: self.name_colour,
             relations: if let Some(crate::User { id, .. }) = perspective {
                 if id == &self.id {
                     self.relations
@@ -1140,6 +1141,7 @@ impl crate::User {
             discriminator: self.discriminator,
             display_name: self.display_name,
             avatar: self.avatar.map(|file| file.into()),
+            name_colour: self.name_colour,
             relations: vec![],
             badges,
             online: can_see_profile
@@ -1173,6 +1175,7 @@ impl crate::User {
             discriminator: self.discriminator,
             display_name: self.display_name,
             avatar: self.avatar.map(|file| file.into()),
+            name_colour: self.name_colour,
             relations: vec![],
             badges,
             online: is_online
@@ -1200,6 +1203,7 @@ impl crate::User {
             discriminator: self.discriminator,
             display_name: self.display_name,
             avatar: self.avatar.map(|file| file.into()),
+            name_colour: self.name_colour,
             relations: self
                 .relations
                 .map(|relationships| {
@@ -1243,6 +1247,7 @@ impl From<User> for crate::User {
             discriminator: value.discriminator,
             display_name: value.display_name,
             avatar: value.avatar.map(Into::into),
+            name_colour: value.name_colour,
             relations: None,
             badges: Some(value.badges as i32),
             status: value.status.map(Into::into),
@@ -1263,6 +1268,7 @@ impl From<crate::PartialUser> for PartialUser {
             discriminator: value.discriminator,
             display_name: value.display_name,
             avatar: value.avatar.map(|file| file.into()),
+            name_colour: value.name_colour,
             relations: value.relations.map(|relationships| {
                 relationships
                     .into_iter()
@@ -1290,6 +1296,7 @@ impl From<FieldsUser> for crate::FieldsUser {
             FieldsUser::StatusPresence => crate::FieldsUser::StatusPresence,
             FieldsUser::StatusText => crate::FieldsUser::StatusText,
             FieldsUser::DisplayName => crate::FieldsUser::DisplayName,
+            FieldsUser::NameColour => crate::FieldsUser::NameColour,
 
             FieldsUser::Internal => crate::FieldsUser::None,
         }
@@ -1305,6 +1312,7 @@ impl From<crate::FieldsUser> for FieldsUser {
             crate::FieldsUser::StatusPresence => FieldsUser::StatusPresence,
             crate::FieldsUser::StatusText => FieldsUser::StatusText,
             crate::FieldsUser::DisplayName => FieldsUser::DisplayName,
+            crate::FieldsUser::NameColour => FieldsUser::NameColour,
 
             crate::FieldsUser::Suspension => FieldsUser::Internal,
             crate::FieldsUser::None => FieldsUser::Internal,

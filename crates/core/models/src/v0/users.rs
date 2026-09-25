@@ -2,7 +2,7 @@ use iso8601_timestamp::Timestamp;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use super::File;
+use super::{File, RE_COLOUR};
 
 #[cfg(feature = "validator")]
 use validator::Validate;
@@ -35,6 +35,9 @@ auto_derived_partial!(
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         /// Avatar attachment
         pub avatar: Option<File>,
+        /// Name colour (solid or gradient CSS, same format as role colours)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub name_colour: Option<String>,
         /// Relationships with other users
         #[cfg_attr(
             feature = "serde",
@@ -89,6 +92,7 @@ auto_derived!(
         ProfileContent,
         ProfileBackground,
         DisplayName,
+        NameColour,
 
         /// Internal field, ignore this.
         Internal,
@@ -228,6 +232,12 @@ auto_derived!(
         /// Attachment Id for avatar
         #[cfg_attr(feature = "validator", validate(length(min = 1, max = 128)))]
         pub avatar: Option<String>,
+        /// New name colour (solid or gradient CSS)
+        #[cfg_attr(
+            feature = "validator",
+            validate(length(min = 1, max = 128), regex = "RE_COLOUR")
+        )]
+        pub name_colour: Option<String>,
 
         /// New user status
         #[cfg_attr(feature = "validator", validate)]
