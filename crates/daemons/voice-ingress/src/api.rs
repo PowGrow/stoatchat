@@ -13,7 +13,10 @@ use revolt_database::{
     Database, AMQP,
 };
 use revolt_result::{create_error, Result, ToRevoltError};
-use revolt_voice_ingress::participation::apply_participant_webhook;
+use revolt_voice_ingress::{
+    participation::apply_participant_webhook,
+    room_state::{apply_room_finished, apply_track_webhook},
+};
 use rocket::{post, tokio::time::Instant, State};
 use rocket_empty::EmptyResponse;
 
@@ -71,6 +74,15 @@ pub async fn ingress(
         .receive(body, &auth_header)
         .to_internal_error()?;
 
+    if versioned_presence.0 && event.event == "room_finished" {
+        let mut conn = redis_kiss::get_connection()
+            .await
+            .map_err(|_| create_error!(InternalError))?
+            .into_inner();
+        apply_room_finished(&mut Presence::new(&mut conn), node, &event, received_at).await?;
+        return Ok(EmptyResponse);
+    }
+
     let channel_id = event.room.as_ref().map(|r| &r.name);
     let user_id = event.participant.as_ref().map(|r| &r.identity);
     // track_* events carry the room object without metadata: parsing the
@@ -87,7 +99,10 @@ pub async fn ingress(
     };
 
     match event.event.as_str() {
-        "participant_joined" | "participant_left" if versioned_presence.0 => {
+        "participant_joined" | "participant_left" | "track_published" | "track_unpublished"
+        | "track_unmuted" | "track_muted"
+            if versioned_presence.0 =>
+        {
             let channel_id = channel_id.to_internal_error()?;
             let scope = match resolve_server_id(db, channel_id, &room_metadata).await? {
                 Some(server_id) => Scope::Server(server_id),
@@ -98,15 +113,24 @@ pub async fn ingress(
                 .await
                 .map_err(|_| create_error!(InternalError))?
                 .into_inner();
-            apply_participant_webhook(
-                &mut Presence::new(&mut conn),
-                livekit,
-                node,
-                &scope,
-                &event,
-                received_at,
-            )
-            .await?;
+            let mut presence = Presence::new(&mut conn);
+            if matches!(
+                event.event.as_str(),
+                "participant_joined" | "participant_left"
+            ) {
+                apply_participant_webhook(
+                    &mut presence,
+                    livekit,
+                    node,
+                    &scope,
+                    &event,
+                    received_at,
+                )
+                .await?;
+            } else {
+                apply_track_webhook(&mut presence, livekit, node, &scope, &event, received_at)
+                    .await?;
+            }
         }
         // User joined a channel
         "participant_joined" => {

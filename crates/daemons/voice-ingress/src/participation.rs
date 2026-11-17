@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use livekit_api::services::{room::RoomClient, ServiceError, TwirpError, TwirpErrorCode};
-use livekit_protocol::WebhookEvent;
+use livekit_protocol::{ParticipantInfo, WebhookEvent};
 use redis_kiss::redis::aio::ConnectionLike;
 use revolt_database::{
     iso8601_timestamp::{Duration as TimestampDuration, Timestamp},
@@ -12,9 +12,9 @@ use revolt_result::{create_error, Result, ToRevoltError};
 use rocket::tokio::time::{sleep, timeout, timeout_at, Instant};
 
 const MAX_DIRECT_AGE_SECONDS: i64 = 60;
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
-const RETRY_BUDGET: Duration = Duration::from_secs(20);
-const RETRY_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const RETRY_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Reconciles an authenticated participant webhook against the named LiveKit node.
 /// A retry-budget error leaves delivery unacknowledged so any redelivery can reconcile afresh.
@@ -26,22 +26,7 @@ pub async fn apply_participant_webhook<C: ConnectionLike + Send>(
     event: &WebhookEvent,
     received_at: Instant,
 ) -> Result<()> {
-    let room = event.room.as_ref().to_internal_error()?;
-    let participant = event.participant.as_ref().to_internal_error()?;
-    let generation = Generation {
-        node: node.to_owned(),
-        room_sid: room.sid.clone(),
-        participant_sid: participant.sid.clone(),
-        channel_id: room.name.clone(),
-    };
-    let user_id = &participant.identity;
-    if [&room.name, &room.sid, user_id, &participant.sid]
-        .iter()
-        .any(|field| field.is_empty())
-        || node.is_empty()
-    {
-        return Err(create_error!(InternalError));
-    }
+    let (user_id, generation) = webhook_participation(node, event)?;
     let state;
     let transition = match event.event.as_str() {
         "participant_joined" => {
@@ -50,7 +35,7 @@ pub async fn apply_participant_webhook<C: ConnectionLike + Send>(
                 .to_internal_error()?;
             state = UserVoiceState {
                 joined_at,
-                id: user_id.clone(),
+                id: user_id.to_owned(),
                 is_receiving: true,
                 is_publishing: false,
                 screensharing: false,
@@ -79,9 +64,12 @@ pub async fn apply_participant_webhook<C: ConnectionLike + Send>(
                 .timestamp()
                 .saturating_sub(event.created_at);
             if joining || !(0..=MAX_DIRECT_AGE_SECONDS).contains(&age) {
-                let lookup = timeout(LOOKUP_TIMEOUT, is_current(livekit, &generation, user_id));
+                let lookup = timeout(
+                    LOOKUP_TIMEOUT,
+                    current_participant(livekit, &generation, user_id),
+                );
                 match lookup.await {
-                    Ok(Ok(current)) if current != joining => return Ok(()),
+                    Ok(Ok(current)) if current.is_some() != joining => return Ok(()),
                     Ok(Ok(_)) => {}
                     failure => {
                         log::debug!("LiveKit participation lookup deferred: {failure:?}");
@@ -108,11 +96,40 @@ pub async fn apply_participant_webhook<C: ConnectionLike + Send>(
     .unwrap_or_else(|_| Err(budget_exhausted()))
 }
 
-async fn is_current(
+pub(crate) fn webhook_participation<'a>(
+    node: &str,
+    event: &'a WebhookEvent,
+) -> Result<(&'a str, Generation)> {
+    let room = event.room.as_ref().to_internal_error()?;
+    let participant = event.participant.as_ref().to_internal_error()?;
+    if [
+        &room.name,
+        &room.sid,
+        &participant.identity,
+        &participant.sid,
+    ]
+    .iter()
+    .any(|field| field.is_empty())
+        || node.is_empty()
+    {
+        return Err(create_error!(InternalError));
+    }
+    Ok((
+        &participant.identity,
+        Generation {
+            node: node.to_owned(),
+            room_sid: room.sid.clone(),
+            participant_sid: participant.sid.clone(),
+            channel_id: room.name.clone(),
+        },
+    ))
+}
+
+pub(crate) async fn current_participant(
     livekit: &RoomClient,
     generation: &Generation,
     user_id: &str,
-) -> std::result::Result<bool, ServiceError> {
+) -> std::result::Result<Option<ParticipantInfo>, ServiceError> {
     let rooms = livekit
         .list_rooms(vec![generation.channel_id.clone()])
         .await?;
@@ -120,19 +137,19 @@ async fn is_current(
         .iter()
         .any(|room| room.name == generation.channel_id && room.sid == generation.room_sid)
     {
-        return Ok(false);
+        return Ok(None);
     }
     match livekit
         .get_participant(&generation.channel_id, user_id)
         .await
     {
-        Ok(participant) => {
-            Ok(participant.identity == user_id && participant.sid == generation.participant_sid)
-        }
+        Ok(participant) => Ok(Some(participant).filter(|participant| {
+            participant.identity == user_id && participant.sid == generation.participant_sid
+        })),
         Err(ServiceError::Twirp(TwirpError::Twirp(error)))
             if error.code == TwirpErrorCode::NOT_FOUND =>
         {
-            Ok(false)
+            Ok(None)
         }
         Err(error) => Err(error),
     }
