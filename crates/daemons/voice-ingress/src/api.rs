@@ -7,15 +7,17 @@ use revolt_database::{
     voice::{
         create_voice_state, delete_channel_voice_state, delete_voice_state,
         get_user_moved_from_voice, get_user_moved_to_voice, get_voice_channel_members,
+        presence::{Presence, Scope},
         update_voice_state_tracks, RoomMetadata, UserVoiceChannel, VoiceClient,
     },
     Database, AMQP,
 };
-use revolt_result::{Result, ToRevoltError};
-use rocket::{post, State};
+use revolt_result::{create_error, Result, ToRevoltError};
+use revolt_voice_ingress::participation::apply_participant_webhook;
+use rocket::{post, tokio::time::Instant, State};
 use rocket_empty::EmptyResponse;
 
-use crate::guard::AuthHeader;
+use crate::{guard::AuthHeader, VersionedPresence};
 
 /// The server id normally comes from room metadata, but some webhook events
 /// (track_*) carry the room without metadata — fall back to the database.
@@ -40,10 +42,12 @@ pub async fn ingress(
     db: &State<Database>,
     voice_client: &State<VoiceClient>,
     _amqp: &State<AMQP>,
+    versioned_presence: &State<VersionedPresence>,
     node: &str,
     auth_header: AuthHeader<'_>,
     body: &str,
 ) -> Result<EmptyResponse> {
+    let received_at = Instant::now();
     log::debug!("received event: {body:?}");
 
     let config = revolt_config::config().await;
@@ -83,6 +87,27 @@ pub async fn ingress(
     };
 
     match event.event.as_str() {
+        "participant_joined" | "participant_left" if versioned_presence.0 => {
+            let channel_id = channel_id.to_internal_error()?;
+            let scope = match resolve_server_id(db, channel_id, &room_metadata).await? {
+                Some(server_id) => Scope::Server(server_id),
+                None => Scope::Channel(channel_id.clone()),
+            };
+            let livekit = &voice_client.get_node(node)?.client;
+            let mut conn = redis_kiss::get_connection()
+                .await
+                .map_err(|_| create_error!(InternalError))?
+                .into_inner();
+            apply_participant_webhook(
+                &mut Presence::new(&mut conn),
+                livekit,
+                node,
+                &scope,
+                &event,
+                received_at,
+            )
+            .await?;
+        }
         // User joined a channel
         "participant_joined" => {
             let channel_id = channel_id.to_internal_error()?;
@@ -95,7 +120,7 @@ pub async fn ingress(
 
             let joined_at = Timestamp::UNIX_EPOCH
                 .checked_add(Duration::seconds(event.created_at))
-                .unwrap();
+                .to_internal_error()?;
 
             let voice_state = create_voice_state(&channel, user_id, joined_at).await?;
 

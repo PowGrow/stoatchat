@@ -7915,6 +7915,7 @@ dependencies = [
  "livekit-runtime",
  "log",
  "lru",
+ "prost",
  "redis-kiss",
  "revolt-config",
  "revolt-database",
