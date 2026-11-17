@@ -461,18 +461,6 @@ pub async fn get_channel_voice_state(
     }
 }
 
-pub async fn move_user(user: &str, from_channel_id: &str, to_channel_id: &str) -> Result<()> {
-    get_connection()
-        .await?
-        .smove(
-            format!("vc_members:{from_channel_id}"),
-            format!("vc_members:{to_channel_id}"),
-            user,
-        )
-        .await
-        .to_internal_error()
-}
-
 pub async fn sync_voice_permissions(
     db: &Database,
     voice_client: &VoiceClient,
