@@ -9,6 +9,7 @@ mod voice_state_set;
 use redis_kiss::redis::{cmd, streams::StreamRangeReply, Client};
 use revolt_database::util::reference::Reference;
 use revolt_database::voice::{
+    get_channel_voice_state,
     presence::{ApplyOutcome, Generation, Presence, Scope, Transition},
     UserVoiceChannel,
 };
@@ -133,6 +134,15 @@ async fn delayed_put_cannot_change_a_replacement_in_the_same_channel() {
     assert_eq!(event["type"], "UserVoiceStateUpdate");
     assert_eq!(event["data"]["is_receiving"], false);
     assert_eq!(event["channel_id"], channel.id);
+    assert_eq!(
+        get_channel_voice_state(&channel)
+            .await
+            .unwrap()
+            .unwrap()
+            .participants,
+        vec![expected]
+    );
+
     let current = request_presence.read(user, &scope).await.unwrap();
     writer_presence = Presence::new(&mut writer);
     writer_presence
@@ -149,4 +159,61 @@ async fn delayed_put_cannot_change_a_replacement_in_the_same_channel() {
     eprintln!(
         "PUT old SID => NotConnected, new SID => is_receiving=false, closed room => NotConnected"
     );
+}
+
+#[rocket::async_test]
+async fn snapshot_ignores_stale_index_without_touching_the_new_participation() {
+    let Ok(url) = std::env::var("NOOK_PUT_TEST_REDIS_URL") else {
+        eprintln!("skipped Redis integration: set NOOK_PUT_TEST_REDIS_URL");
+        return;
+    };
+    let mut info = Client::open(url).unwrap().get_connection_info().clone();
+    info.redis.db += 1;
+    let mut conn = Client::open(info)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let keys: u64 = cmd("DBSIZE").query_async(&mut conn).await.unwrap();
+    assert_eq!(keys, 0);
+    let mut presence = Presence::new(&mut conn);
+    let scope = Scope::Server("server".into());
+    let new = Generation {
+        node: "node".into(),
+        room_sid: "room-new".into(),
+        participant_sid: "participant-new".into(),
+        channel_id: "new".into(),
+    };
+    let state = UserVoiceState {
+        id: "user".into(),
+        joined_at: revolt_database::iso8601_timestamp::Timestamp::UNIX_EPOCH,
+        is_receiving: true,
+        is_publishing: false,
+        screensharing: false,
+        camera: false,
+    };
+    let initial = presence.read(&state.id, &scope).await.unwrap();
+    presence
+        .apply(&initial, Transition::Join(&new, &state))
+        .await
+        .unwrap();
+    const OLD_INDEX: &str = "vp2:{voice}:channel:b2xk";
+    let _: u64 = cmd("HSET")
+        .arg((OLD_INDEX, &state.id, "s:c2VydmVy"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let mut presence = Presence::new(&mut conn);
+    assert!(presence.channel_states("old").await.unwrap().is_empty());
+    assert_eq!(presence.channel_states("new").await.unwrap(), vec![state]);
+    let current = presence.read("user", &scope).await.unwrap();
+    assert_eq!(current.generation(), Some(&new));
+    assert_eq!(current.revision(), 1);
+    let members: u64 = cmd("HLEN")
+        .arg(OLD_INDEX)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(members, 1);
+    eprintln!("Snapshot skipped a stale index and preserved the replacement slot and indexes");
 }

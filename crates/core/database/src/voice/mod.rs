@@ -423,6 +423,17 @@ pub async fn get_voice_state(
 pub async fn get_channel_voice_state(
     channel: &UserVoiceChannel,
 ) -> Result<Option<v0::ChannelVoiceState>> {
+    if versioned_presence_enabled() {
+        let mut conn = get_connection().await?.into_inner();
+        let participants = presence::Presence::new(&mut conn)
+            .channel_states(&channel.id)
+            .await
+            .to_internal_error()?;
+        return Ok((!participants.is_empty()).then(|| v0::ChannelVoiceState {
+            id: channel.id.clone(),
+            participants,
+        }));
+    }
     let members = get_voice_channel_members(channel).await?;
 
     if let Some(members) = members {

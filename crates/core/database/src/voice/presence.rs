@@ -171,6 +171,27 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
         })
     }
 
+    /// Reads indexed participants and ignores slots that have already moved or left.
+    /// A read never edits the indexes. A consistent snapshot with a cursor requires
+    /// reading the slots and event stream together.
+    pub async fn channel_states(&mut self, channel_id: &str) -> RedisResult<Vec<UserVoiceState>> {
+        let members: HashMap<String, String> = cmd("HGETALL")
+            .arg(channel_key(channel_id))
+            .query_async(self.conn)
+            .await?;
+        let mut participants = Vec::with_capacity(members.len());
+        for (user_id, scope) in members {
+            let snapshot = self.read(&user_id, &Scope::from_key(&scope)?).await?;
+            if let Some(active) = snapshot
+                .active
+                .filter(|active| active.generation.channel_id == channel_id)
+            {
+                participants.push(active.state);
+            }
+        }
+        Ok(participants)
+    }
+
     /// Updates deafen for exactly the participation captured at the start of PUT.
     /// A stale revision or terminal participation returns NotConnected without a retry.
     pub async fn set_receiving(
@@ -426,15 +447,16 @@ fn slot_key(encoded_user: &str, scope: &str) -> String {
 
 fn index_keys(generation: &Generation) -> (String, String) {
     (
-        format!(
-            "{PREFIX}:channel:{}",
-            URL_SAFE_NO_PAD.encode(&generation.channel_id)
-        ),
+        channel_key(&generation.channel_id),
         format!(
             "{PREFIX}:room:{}",
             room_key_suffix(&generation.node, &generation.room_sid)
         ),
     )
+}
+
+fn channel_key(channel_id: &str) -> String {
+    format!("{PREFIX}:channel:{}", URL_SAFE_NO_PAD.encode(channel_id))
 }
 
 fn invalid(message: &'static str) -> RedisError {
