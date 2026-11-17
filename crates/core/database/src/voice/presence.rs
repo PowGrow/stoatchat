@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use redis_kiss::redis::{aio::ConnectionLike, cmd, ErrorKind, RedisError, RedisResult};
 use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
+use revolt_result::{create_error, Result, ToRevoltError};
 use serde::{Deserialize, Serialize};
 
 use crate::events::client::EventV1;
@@ -114,6 +115,7 @@ pub enum Transition<'a> {
     Leave(&'a Generation),
     /// Fences earlier track lookups even when the resulting flags are unchanged.
     Tracks(&'a Generation, TrackState),
+    Receiving(&'a Generation, Option<bool>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -169,6 +171,28 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
         })
     }
 
+    /// Updates deafen for exactly the participation captured at the start of PUT.
+    /// A stale revision or terminal participation returns NotConnected without a retry.
+    pub async fn set_receiving(
+        &mut self,
+        snapshot: &Snapshot,
+        channel_id: &str,
+        receiving: Option<bool>,
+    ) -> Result<()> {
+        let generation = snapshot
+            .generation()
+            .filter(|generation| generation.channel_id == channel_id)
+            .ok_or_else(|| create_error!(NotConnected))?;
+        match self
+            .apply(snapshot, Transition::Receiving(generation, receiving))
+            .await
+            .to_internal_error()?
+        {
+            ApplyOutcome::Applied(_) => Ok(()),
+            ApplyOutcome::Conflict | ApplyOutcome::Unchanged => Err(create_error!(NotConnected)),
+        }
+    }
+
     /// Fences new writes for this room SID, then removes its indexed participations.
     /// Retrying after interruption drains the remaining members without duplicate events.
     pub async fn finish_room(&mut self, node: &str, room_sid: &str) -> RedisResult<()> {
@@ -222,6 +246,7 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
             Transition::Join(generation, _) => ("join", generation),
             Transition::Leave(generation) => ("leave", generation),
             Transition::Tracks(generation, _) => ("tracks", generation),
+            Transition::Receiving(generation, _) => ("receiving", generation),
         };
         if [
             &generation.channel_id,
@@ -308,6 +333,34 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
                         data: partial,
                     };
                     (active, Some(event), "")
+                }
+            }
+            Transition::Receiving(_, receiving) => {
+                let Some(mut state) = snapshot
+                    .state()
+                    .filter(|_| current == Some(generation))
+                    .cloned()
+                else {
+                    return Ok(ApplyOutcome::Unchanged);
+                };
+                if let Some(value) = receiving {
+                    state.is_receiving = value;
+                    let active = serde_json::to_string(&Active {
+                        generation: generation.clone(),
+                        state,
+                    })
+                    .map_err(json_error)?;
+                    let event = EventV1::UserVoiceStateUpdate {
+                        id: user_id.clone(),
+                        channel_id: generation.channel_id.clone(),
+                        data: PartialUserVoiceState {
+                            is_receiving: receiving,
+                            ..Default::default()
+                        },
+                    };
+                    (active, Some(event), "")
+                } else {
+                    (String::new(), None, "")
                 }
             }
             Transition::Join(..) | Transition::Leave(_) => (String::new(), None, ""),

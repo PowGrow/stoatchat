@@ -1,7 +1,10 @@
 use revolt_database::{
     events::client::EventV1,
     util::reference::Reference,
-    voice::{is_in_voice_channel, update_voice_state, UserVoiceChannel},
+    voice::{
+        is_in_voice_channel, set_versioned_voice_receiving, update_voice_state,
+        versioned_presence_enabled, UserVoiceChannel,
+    },
     Database, User,
 };
 use revolt_models::v0;
@@ -31,14 +34,19 @@ pub async fn set_voice_state(
 
     let user_voice_channel = UserVoiceChannel::from_channel(&channel);
 
-    if !is_in_voice_channel(&user.id, &user_voice_channel).await? {
-        return Err(create_error!(NotConnected));
-    }
-
     let partial = v0::PartialUserVoiceState {
         is_receiving: data.is_receiving,
         ..Default::default()
     };
+
+    if versioned_presence_enabled() {
+        set_versioned_voice_receiving(&user_voice_channel, &user.id, partial.is_receiving).await?;
+        return Ok(Json(partial));
+    }
+
+    if !is_in_voice_channel(&user.id, &user_voice_channel).await? {
+        return Err(create_error!(NotConnected));
+    }
 
     update_voice_state(&user_voice_channel, &user.id, &partial).await?;
 

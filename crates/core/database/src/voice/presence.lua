@@ -23,7 +23,8 @@ end
 if payload ~= '' then
     -- Redis does not roll back script writes on error. Check the index types
     -- before XADD, then append before touching indexes in case the stream is exhausted.
-    if operation ~= 'tracks' then
+    local changes_membership = operation == 'join' or operation == 'leave'
+    if changes_membership then
         for _, key in ipairs({user_index, old_channel, old_room, new_channel, new_room}) do
             if key ~= '' then
                 local kind = redis.call('TYPE', key).ok
@@ -40,7 +41,7 @@ if payload ~= '' then
             'from_channel_id', from_channel)
     end
 
-    if operation ~= 'tracks' and old_channel ~= '' then
+    if changes_membership and old_channel ~= '' then
         redis.call('HDEL', old_channel, user_id)
         redis.call('HDEL', old_room, user_id)
     end

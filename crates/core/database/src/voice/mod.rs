@@ -22,10 +22,33 @@ pub mod presence;
 mod voice_client;
 pub use voice_client::VoiceClient;
 
+/// Enables versioned Redis presence during the coordinated server cutover.
+pub fn versioned_presence_enabled() -> bool {
+    std::env::var("STOAT_VOICE_PRESENCE_V2").as_deref() == Ok("1")
+}
+
 async fn get_connection() -> Result<Conn> {
     _get_connection()
         .await
         .map_err(|_| create_error!(InternalError))
+}
+
+/// Pins the active SID and revision for a single deafen update.
+pub async fn set_versioned_voice_receiving(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+    receiving: Option<bool>,
+) -> Result<()> {
+    let mut conn = get_connection().await?.into_inner();
+    let mut presence = presence::Presence::new(&mut conn);
+    let scope = match &channel.server_id {
+        Some(server_id) => presence::Scope::Server(server_id.clone()),
+        None => presence::Scope::Channel(channel.id.clone()),
+    };
+    let snapshot = presence.read(user_id, &scope).await.to_internal_error()?;
+    presence
+        .set_receiving(&snapshot, &channel.id, receiving)
+        .await
 }
 
 pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Result<()> {
