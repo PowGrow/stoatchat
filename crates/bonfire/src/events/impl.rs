@@ -1,17 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
 use futures::future::join_all;
-use redis_kiss::AsyncCommands;
+use redis_kiss::get_connection;
 use revolt_database::{
     events::client::{EventV1, ReadyPayloadFields},
     util::permissions::DatabasePermissionQuery,
-    voice::{get_channel_voice_state, UserVoiceChannel},
+    voice::{
+        get_channel_voice_state, presence::Presence as VoicePresence, versioned_presence_enabled,
+        UserVoiceChannel,
+    },
     Channel, Database, Member, MemberCompositeKey, Presence, RelationshipStatus,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_presence::filter_online;
-use revolt_result::Result;
+use revolt_result::{create_error, Result, ToRevoltError};
 
 use super::state::{Cache, State};
 
@@ -127,6 +130,12 @@ impl State {
         // Fetch all memberships with their corresponding servers.
         let mut members: Vec<Member> = db.fetch_all_memberships(&user.id).await?;
 
+        self.cache.members = members
+            .iter()
+            .cloned()
+            .map(|member| (member.id.server.clone(), member))
+            .collect();
+
         let server_ids: Vec<String> = members.iter().map(|x| x.id.server.clone()).collect();
         let servers = db.fetch_servers(&server_ids).await?;
         self.cache.servers = servers.iter().cloned().map(|x| (x.id.clone(), x)).collect();
@@ -154,54 +163,64 @@ impl State {
             }
         }
 
-        let voice_states = if fields.voice_states {
-            let mut voice_state_server_members: HashMap<String, HashSet<String>> = HashMap::new();
-
-            // fetch voice states for all the channels we can see
-            let mut voice_states = Vec::new();
-
-            for channel in channels.iter().filter(|c| {
+        let voice_channels: HashMap<_, _> = channels
+            .iter()
+            .filter(|channel| {
                 matches!(
-                    c,
+                    channel,
                     Channel::DirectMessage { .. }
                         | Channel::Group { .. }
                         | Channel::TextChannel { voice: Some(_), .. }
                 )
-            }) {
-                if let Ok(Some(voice_state)) =
+            })
+            .map(|channel| (channel.id(), channel))
+            .collect();
+
+        let voice_states = if versioned_presence_enabled() {
+            let mut conn = get_connection()
+                .await
+                .map_err(|_| create_error!(InternalError))?;
+            let snapshot_channels = voice_channels
+                .keys()
+                .copied()
+                .filter(|_| fields.voice_states);
+            let (states, cursor) = VoicePresence::new(&mut *conn)
+                .ready_snapshot(snapshot_channels)
+                .await
+                .to_internal_error()?;
+            self.voice_cursor = Some(cursor);
+            fields.voice_states.then_some(states)
+        } else if fields.voice_states {
+            let mut states = Vec::new();
+            for channel in voice_channels.values() {
+                if let Ok(Some(state)) =
                     get_channel_voice_state(&UserVoiceChannel::from_channel(channel)).await
                 {
-                    if let Some(server) = channel.server() {
-                        let set = voice_state_server_members
-                            .entry(server.to_string())
-                            .or_default();
-
-                        for participant in &voice_state.participants {
-                            user_ids.insert(participant.id.clone());
-                            set.insert(participant.id.clone());
-                        }
-                    } else {
-                        for participant in &voice_state.participants {
-                            user_ids.insert(participant.id.clone());
-                        }
-                    }
-
-                    voice_states.push(voice_state);
+                    states.push(state);
                 }
             }
-
-            // Fetch all the members for for the participants who are in a server
-            for (server, user_ids) in voice_state_server_members {
-                let user_ids = user_ids.into_iter().collect::<Vec<_>>();
-                let voice_members = db.fetch_members(&server, &user_ids).await?;
-
-                members.extend(voice_members);
-            }
-
-            Some(voice_states)
+            Some(states)
         } else {
             None
         };
+
+        if let Some(states) = &voice_states {
+            let mut voice_members: HashMap<&str, HashSet<String>> = HashMap::new();
+            for state in states {
+                let ids = state
+                    .participants
+                    .iter()
+                    .map(|participant| participant.id.clone());
+                user_ids.extend(ids.clone());
+                if let Some(server) = voice_channels[state.id.as_str()].server() {
+                    voice_members.entry(server).or_default().extend(ids);
+                }
+            }
+            for (server, ids) in voice_members {
+                let ids: Vec<_> = ids.into_iter().collect();
+                members.extend(db.fetch_members(server, &ids).await?);
+            }
+        }
 
         // Fetch presence data for known users.
         let online_ids = filter_online(&user_ids.iter().cloned().collect::<Vec<String>>()).await;
@@ -215,12 +234,6 @@ impl State {
                     .collect::<Vec<String>>(),
             )
             .await?;
-
-        self.cache.members = members
-            .iter()
-            .cloned()
-            .map(|x| (x.id.server.clone(), x))
-            .collect();
 
         // Fetch customisations.
         let emojis = if fields.emojis {

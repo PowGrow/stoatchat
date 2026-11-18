@@ -1,4 +1,9 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_tungstenite::WebSocketStream;
 use authifier::AuthifierEvent;
@@ -9,6 +14,7 @@ use fred::{
 };
 use futures::{
     channel::oneshot,
+    future::pending,
     join, pin_mut, select,
     stream::{SplitSink, SplitStream},
     FutureExt, SinkExt, StreamExt, TryStreamExt,
@@ -18,6 +24,7 @@ use revolt_config::report_internal_error;
 use revolt_database::{
     events::{client::EventV1, server::ClientMessage},
     iso8601_timestamp::Timestamp,
+    voice::presence::{Presence as VoicePresence, JOURNAL_BATCH_SIZE},
     Database, User, UserHint,
 };
 use revolt_presence::{create_session, delete_session};
@@ -31,8 +38,14 @@ use revolt_result::create_error;
 use sentry::Level;
 
 use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
-use crate::events::state::{State, SubscriptionStateChange};
+use crate::events::{
+    state::{State, SubscriptionStateChange},
+    voice,
+};
 use revolt_models::v0;
+
+const VOICE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const VOICE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 type WsReader = SplitStream<WebSocketStream<TcpStream>>;
 type WsWriter = SplitSink<WebSocketStream<TcpStream>, async_tungstenite::tungstenite::Message>;
@@ -265,6 +278,7 @@ async fn listener(
     });
 
     let mut message_rx = subscriber.message_rx();
+    let mut next_voice_read = Instant::now();
     'out: loop {
         // Check for state changes for subscriptions.
         match state.apply_state().await {
@@ -310,7 +324,18 @@ async fn listener(
         let t3 = kill_signal_r.recv().fuse();
         let t4 = clean_up_r.recv().fuse();
 
-        pin_mut!(t1, t2, t3, t4);
+        let reads_voice = state.voice_cursor.is_some();
+        let t5 = async move {
+            if reads_voice {
+                async_std::task::sleep(next_voice_read.saturating_duration_since(Instant::now()))
+                    .await;
+            } else {
+                pending::<()>().await;
+            }
+        }
+        .fuse();
+
+        pin_mut!(t1, t2, t3, t4, t5);
 
         select! {
             _ = t4 => {
@@ -320,6 +345,18 @@ async fn listener(
                 break 'out;
             },
             _ = t2 => {},
+            _ = t5 => {
+                match send_voice_batch(state, config, write).await {
+                    Some(true) => next_voice_read = Instant::now(),
+                    Some(false) => next_voice_read = Instant::now() + VOICE_POLL_INTERVAL,
+                    None => {
+                        async_std::future::timeout(VOICE_IO_TIMEOUT, async {
+                            write.lock().await.close().await
+                        }).await.ok();
+                        break 'out;
+                    }
+                }
+            },
             message = t1 => {
                 // Handle incoming events.
                 let message = match report_internal_error!(message) {
@@ -354,6 +391,10 @@ async fn listener(
                     sentry::capture_message(&err, Level::Error);
                     break 'out;
                 };
+
+                if reads_voice && voice::is_journal_event(&event) {
+                    continue;
+                }
 
                 if let EventV1::Auth(auth) = &event {
                     if let AuthifierEvent::DeleteSession { session_id, .. } = auth {
@@ -400,6 +441,51 @@ async fn listener(
     }
 
     report_internal_error!(subscriber.quit().await).ok();
+}
+
+// Returns whether the next batch should be read immediately. A gap or a read
+// failure ends this socket so its next Ready establishes a new cursor.
+async fn send_voice_batch(
+    state: &mut State,
+    config: &ProtocolConfiguration,
+    write: &Mutex<WsWriter>,
+) -> Option<bool> {
+    let cursor = state.voice_cursor.as_mut()?;
+    let batch = report_internal_error!(
+        async_std::future::timeout(VOICE_IO_TIMEOUT, async {
+            let mut conn = report_internal_error!(get_connection().await).ok()?;
+            let batch =
+                report_internal_error!(VoicePresence::new(&mut *conn).events_after(cursor).await)
+                    .ok()?;
+            Some(batch)
+        })
+        .await
+    )
+    .ok()?;
+    let Some(batch) = batch? else {
+        warn!("Voice journal lost entries after {cursor:?}; closing socket for a fresh Ready");
+        return None;
+    };
+
+    let full_batch = batch.len() == JOURNAL_BATCH_SIZE;
+    for entry in batch {
+        let event = {
+            let subscribed = state.subscribed.read().await;
+            voice::for_subscriptions(entry.event, &subscribed)
+        };
+        if let Some(event) = event {
+            let sent = report_internal_error!(
+                async_std::future::timeout(VOICE_IO_TIMEOUT, async {
+                    write.lock().await.send(config.encode(&event)).await
+                },)
+                .await
+            )
+            .ok()?;
+            report_internal_error!(sent).ok()?;
+        }
+        *cursor = entry.id;
+    }
+    Some(full_batch)
 }
 
 #[allow(clippy::too_many_arguments)]

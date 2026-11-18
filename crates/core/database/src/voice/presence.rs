@@ -3,15 +3,40 @@
 use std::collections::HashMap;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use redis_kiss::redis::{aio::ConnectionLike, cmd, ErrorKind, RedisError, RedisResult};
-use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
+use redis_kiss::redis::{
+    aio::ConnectionLike, cmd, streams::StreamRangeReply, ErrorKind, RedisError, RedisResult,
+};
+use revolt_models::v0::{ChannelVoiceState, PartialUserVoiceState, UserVoiceState};
 use revolt_result::{create_error, Result, ToRevoltError};
 use serde::{Deserialize, Serialize};
 
 use crate::events::client::EventV1;
 
 const PREFIX: &str = "vp2:{voice}";
-const APPLY: &str = include_str!("presence.lua");
+const STREAM: &str = "vp2:{voice}:events";
+const APPLY: &str = concat!(
+    include_str!("journal_tail.lua"),
+    include_str!("presence.lua")
+);
+const READY_SNAPSHOT: &str = concat!(
+    include_str!("journal_tail.lua"),
+    include_str!("ready_snapshot.lua")
+);
+const READ_JOURNAL: &str = concat!(
+    include_str!("journal_tail.lua"),
+    include_str!("read_journal.lua")
+);
+pub const JOURNAL_BATCH_SIZE: usize = 128;
+
+/// An opaque Redis Stream position shared by the Ready snapshot and its reader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor(String);
+
+/// An internal envelope. Only its public event is serialized to clients.
+pub struct JournalEvent {
+    pub id: Cursor,
+    pub event: EventV1,
+}
 
 /// A user shares one slot per server and has independent slots for private channels.
 #[derive(Clone, Debug)]
@@ -282,6 +307,75 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
         Ok(participants)
     }
 
+    /// Reads all visible channels and the stream watermark in one Redis operation.
+    pub async fn ready_snapshot<'channel>(
+        &mut self,
+        channel_ids: impl IntoIterator<Item = &'channel str>,
+    ) -> RedisResult<(Vec<ChannelVoiceState>, Cursor)> {
+        let ids: Vec<_> = channel_ids.into_iter().collect();
+        let (tail, states): (String, Vec<Vec<String>>) = cmd("EVAL")
+            .arg(READY_SNAPSHOT)
+            .arg(ids.len() + 1)
+            .arg(STREAM)
+            .arg(ids.iter().map(|id| channel_key(id)).collect::<Vec<_>>())
+            .arg(PREFIX)
+            .query_async(self.conn)
+            .await?;
+        let mut channels = Vec::new();
+        for (id, states) in ids.into_iter().zip(states) {
+            let mut participants = Vec::new();
+            for state in states {
+                let active: Active = serde_json::from_str(&state).map_err(json_error)?;
+                if active.generation.channel_id == id {
+                    participants.push(active.state);
+                }
+            }
+            if !participants.is_empty() {
+                channels.push(ChannelVoiceState {
+                    id: id.to_owned(),
+                    participants,
+                });
+            }
+        }
+        Ok((channels, Cursor(tail)))
+    }
+
+    /// Reads a bounded batch strictly after the cursor. A gap requires a fresh Ready.
+    pub async fn events_after(
+        &mut self,
+        cursor: &Cursor,
+    ) -> RedisResult<Option<Vec<JournalEvent>>> {
+        // Redis encodes a Lua false as nil, even when the rest of the reply is an array.
+        let entries: Option<StreamRangeReply> = cmd("EVAL")
+            .arg(READ_JOURNAL)
+            .arg(1)
+            .arg(STREAM)
+            .arg(&cursor.0)
+            .arg(JOURNAL_BATCH_SIZE)
+            .query_async(self.conn)
+            .await?;
+        let Some(entries) = entries else {
+            return Ok(None);
+        };
+        let mut previous = cursor.clone();
+        let mut batch = Vec::with_capacity(entries.ids.len());
+        for entry in entries.ids {
+            if entry.get::<String>("previous").as_ref() != Some(&previous.0) {
+                return Ok(None);
+            }
+            let payload: String = entry
+                .get("payload")
+                .ok_or_else(|| invalid("missing voice journal payload"))?;
+            let event = serde_json::from_str(&payload).map_err(json_error)?;
+            previous = Cursor(entry.id);
+            batch.push(JournalEvent {
+                id: previous.clone(),
+                event,
+            });
+        }
+        Ok(Some(batch))
+    }
+
     /// Updates deafen for exactly the participation captured at the start of PUT.
     /// A stale revision or terminal participation returns NotConnected without a retry.
     pub async fn set_receiving(
@@ -500,7 +594,7 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
             .arg(new_room)
             .arg(format!("{PREFIX}:ended:participant:{room}:{participant}"))
             .arg(format!("{PREFIX}:ended:room:{room}"))
-            .arg(format!("{PREFIX}:events"))
+            .arg(STREAM)
             .arg(snapshot.revision.to_string())
             .arg(snapshot.active_json.as_deref().unwrap_or_default())
             .arg(

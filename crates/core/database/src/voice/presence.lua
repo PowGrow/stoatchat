@@ -34,10 +34,16 @@ if payload ~= '' then
             end
         end
     end
+    -- Record the predecessor even when retention evicts it. The reader can
+    -- distinguish a missing anchor from a missing event it has yet to see.
+    local previous = journal_tail(events)
+    local retained = 10000
     if from_channel == '' then
-        redis.call('XADD', events, '*', 'channel_id', channel_id, 'payload', payload)
+        redis.call('XADD', events, 'MAXLEN', '~', retained, '*',
+            'previous', previous, 'channel_id', channel_id, 'payload', payload)
     else
-        redis.call('XADD', events, '*', 'channel_id', channel_id, 'payload', payload,
+        redis.call('XADD', events, 'MAXLEN', '~', retained, '*',
+            'previous', previous, 'channel_id', channel_id, 'payload', payload,
             'from_channel_id', from_channel)
     end
 

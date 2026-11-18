@@ -1,11 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet}, num::NonZeroUsize, sync::Arc, time::Duration
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
 };
 
 use async_std::sync::{Mutex, RwLock};
 use lru::LruCache;
 use lru_time_cache::{LruCache as LruTimeCache, TimedEntry};
-use revolt_database::{Channel, Member, Server, User};
+use revolt_database::{voice::presence::Cursor, Channel, Member, Server, User};
 
 /// Enumeration representing some change in subscriptions
 pub enum SubscriptionStateChange {
@@ -64,6 +67,8 @@ impl Default for Cache {
 pub struct State {
     pub cache: Cache,
 
+    pub voice_cursor: Option<Cursor>,
+
     pub session_id: String,
     pub private_topic: String,
     pub state: SubscriptionStateChange,
@@ -89,6 +94,7 @@ impl State {
 
         State {
             cache,
+            voice_cursor: None,
             subscribed: Arc::new(RwLock::new(subscribed)),
             active_servers: Arc::new(Mutex::new(LruTimeCache::with_expiry_duration_and_capacity(
                 Duration::from_secs(900),
