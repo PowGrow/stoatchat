@@ -7679,6 +7679,7 @@ dependencies = [
  "nanoid",
  "num_enum",
  "once_cell",
+ "prost",
  "rand 0.8.5",
  "redis-kiss",
  "regex",

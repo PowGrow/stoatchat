@@ -565,7 +565,20 @@ pub async fn sync_user_voice_permissions(
     }) {
         let user_voice_channel = UserVoiceChannel::from_channel(channel);
 
-        let Some(voice_state) = get_voice_state(&user_voice_channel, &user.id).await? else {
+        let versioned = versioned_presence_enabled();
+        let pinned = if versioned {
+            read_current_participation(&user_voice_channel, &user.id).await?
+        } else {
+            None
+        };
+        let voice_state = if versioned {
+            pinned
+                .as_ref()
+                .and_then(|snapshot| snapshot.state().cloned())
+        } else {
+            get_voice_state(&user_voice_channel, &user.id).await?
+        };
+        let Some(voice_state) = voice_state else {
             return Ok(());
         };
 
@@ -596,11 +609,13 @@ pub async fn sync_user_voice_permissions(
         update_event.screensharing = voice_state.screensharing.then_some(can_video);
         update_event.is_publishing = voice_state.is_publishing.then_some(can_speak);
 
-        update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
-
-        voice_client
+        if !versioned {
+            update_voice_state(&user_voice_channel, &user.id, &update_event).await?;
+        }
+        let generation = pinned.as_ref().and_then(|snapshot| snapshot.generation());
+        let participant = voice_client
             .update_permissions(
-                node,
+                generation.map_or(node, |generation| generation.node.as_str()),
                 user,
                 channel_id,
                 ParticipantPermission {
@@ -612,7 +627,18 @@ pub async fn sync_user_voice_permissions(
             )
             .await?;
 
-        if update_event != before {
+        if let Some(snapshot) = pinned {
+            if snapshot
+                .generation()
+                .is_some_and(|generation| participant.sid == generation.participant_sid)
+            {
+                let mut conn = get_connection().await?.into_inner();
+                presence::Presence::new(&mut conn)
+                    .restrict_tracks(snapshot, can_speak, can_video)
+                    .await
+                    .to_internal_error()?;
+            }
+        } else if update_event != before {
             EventV1::UserVoiceStateUpdate {
                 id: user.id.clone(),
                 channel_id: channel_id.to_string(),

@@ -209,6 +209,27 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
             .await
     }
 
+    /// Projects restrictions from a successful LiveKit ACL update onto Redis.
+    /// A concurrent update to deafen is preserved, as is any replacement generation.
+    pub async fn restrict_tracks(
+        &mut self,
+        snapshot: Snapshot,
+        can_speak: bool,
+        can_video: bool,
+    ) -> RedisResult<()> {
+        self.apply_to_current(snapshot, |generation, state| {
+            Transition::Tracks(
+                generation,
+                TrackState {
+                    microphone: state.is_publishing && can_speak,
+                    camera: state.camera && can_video,
+                    screensharing: state.screensharing && can_video,
+                },
+            )
+        })
+        .await
+    }
+
     async fn apply_to_current<F>(
         &mut self,
         mut snapshot: Snapshot,

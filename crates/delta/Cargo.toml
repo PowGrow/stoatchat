@@ -90,3 +90,6 @@ livekit-protocol = { workspace = true }
 
 [build-dependencies]
 vergen = { workspace = true }
+
+[dev-dependencies]
+prost = "0.12.6"

@@ -7,15 +7,17 @@ use revolt_database::{
         reference::Reference,
     },
     voice::{
-        get_channel_node, get_user_voice_channel_in_server, set_channel_node,
-        set_user_moved_from_voice, set_user_moved_to_voice, sync_user_voice_permissions,
-        UserVoiceChannel, VoiceClient,
+        get_channel_node, get_user_voice_channel_in_server, remove_user_from_voice_channel,
+        set_channel_node, set_user_moved_from_voice, set_user_moved_to_voice,
+        sync_user_voice_permissions, versioned_presence_enabled, UserVoiceChannel, VoiceClient,
     },
     Database, File, PartialMember, User,
 };
 use revolt_models::v0::{self, FieldsMember};
 
-use revolt_permissions::{calculate_channel_permissions, calculate_server_permissions, ChannelPermission, UserPermission};
+use revolt_permissions::{
+    calculate_channel_permissions, calculate_server_permissions, ChannelPermission, UserPermission,
+};
 use revolt_result::{create_error, Result};
 use rocket::{form::validate::Contains, serde::json::Json, State};
 use validator::Validate;
@@ -70,7 +72,7 @@ pub async fn edit(
         } else if data.remove.contains(&v0::FieldsMember::Avatar) {
             permissions.throw_if_lacking_channel_permission(ChannelPermission::RemoveAvatars)?;
         } else {
-            return Err(create_error!(InvalidOperation))
+            return Err(create_error!(InvalidOperation));
         }
     }
 
@@ -126,7 +128,8 @@ pub async fn edit(
             Err(create_error!(UnknownChannel))?
         }
 
-        let channel_permissions = calculate_channel_permissions(&mut query.clone().channel(&channel)).await;
+        let channel_permissions =
+            calculate_channel_permissions(&mut query.clone().channel(&channel)).await;
         channel_permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;
 
         if get_user_voice_channel_in_server(&target_user.id, &server.id)
@@ -203,13 +206,19 @@ pub async fn edit(
     }
 
     member
-        .update(db, partial, remove.clone().into_iter().map(Into::into).collect())
+        .update(
+            db,
+            partial,
+            remove.clone().into_iter().map(Into::into).collect(),
+        )
         .await?;
 
     if let Some(new_voice_channel) = new_voice_channel {
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
-            let old_node = get_channel_node(&channel).await?.unwrap();
+            let old_node = get_channel_node(&channel)
+                .await?
+                .ok_or_else(|| create_error!(UnknownNode))?;
 
             let new_node = match get_channel_node(new_voice_channel.id()).await? {
                 Some(node) => node,
@@ -219,19 +228,21 @@ pub async fn edit(
                 }
             };
 
-            let new_user_voice_channel = UserVoiceChannel::from_channel(&new_voice_channel);
-            let old_user_voice_channel = UserVoiceChannel {
-                id: channel.clone(),
-                server_id: new_user_voice_channel.server_id.clone(),
-            };
-
-            set_user_moved_from_voice(&channel, &new_user_voice_channel, &target_user.id).await?;
-            set_user_moved_to_voice(
-                new_voice_channel.id(),
-                &old_user_voice_channel,
-                &target_user.id,
-            )
-            .await?;
+            if !versioned_presence_enabled() {
+                let new_user_voice_channel = UserVoiceChannel::from_channel(&new_voice_channel);
+                let old_user_voice_channel = UserVoiceChannel {
+                    id: channel.clone(),
+                    server_id: new_user_voice_channel.server_id.clone(),
+                };
+                set_user_moved_from_voice(&channel, &new_user_voice_channel, &target_user.id)
+                    .await?;
+                set_user_moved_to_voice(
+                    new_voice_channel.id(),
+                    &old_user_voice_channel,
+                    &target_user.id,
+                )
+                .await?;
+            }
 
             let mut query = perms(db, &target_user).channel(&new_voice_channel);
             let permissions = calculate_channel_permissions(&mut query).await;
@@ -256,17 +267,23 @@ pub async fn edit(
             .private(target_user.id.clone())
             .await;
         };
-    } else if can_publish.is_some() || can_receive.is_some() || remove.contains(FieldsMember::CanPublish) || remove.contains(FieldsMember::CanReceive) {
+    } else if can_publish.is_some()
+        || can_receive.is_some()
+        || remove.contains(FieldsMember::CanPublish)
+        || remove.contains(FieldsMember::CanReceive)
+    {
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
-            let node = get_channel_node(&channel).await?.unwrap();
+            let node = get_channel_node(&channel)
+                .await?
+                .ok_or_else(|| create_error!(UnknownNode))?;
             let channel = Reference::from_unchecked(&channel).as_channel(db).await?;
 
             sync_user_voice_permissions(
                 db,
                 voice_client,
                 &node,
-                &user,
+                &target_user,
                 &channel,
                 Some(&server),
                 None,
@@ -278,9 +295,21 @@ pub async fn edit(
     if remove.contains(&FieldsMember::VoiceChannel) {
         if let Some(channel) = get_user_voice_channel_in_server(&target_user.id, &server.id).await?
         {
-            let node = get_channel_node(&channel).await?.unwrap();
-
-            voice_client.remove_user(&node, &user.id, &channel).await?;
+            if versioned_presence_enabled() {
+                remove_user_from_voice_channel(
+                    voice_client,
+                    &UserVoiceChannel {
+                        id: channel,
+                        server_id: Some(server.id.clone()),
+                    },
+                    &target_user.id,
+                )
+                .await?;
+            } else if let Some(node) = get_channel_node(&channel).await? {
+                voice_client
+                    .remove_user(&node, &target_user.id, &channel)
+                    .await?;
+            }
         };
     }
 

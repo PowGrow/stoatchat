@@ -159,6 +159,7 @@ async fn delayed_put_cannot_change_a_replacement_in_the_same_channel() {
     eprintln!(
         "PUT old SID => NotConnected, new SID => is_receiving=false, closed room => NotConnected"
     );
+    verify_admin_writers(&client).await;
 }
 
 #[rocket::async_test]
@@ -216,4 +217,237 @@ async fn snapshot_ignores_stale_index_without_touching_the_new_participation() {
         .unwrap();
     assert_eq!(members, 1);
     eprintln!("Snapshot skipped a stale index and preserved the replacement slot and indexes");
+}
+
+type RpcRequest = (
+    String,
+    Vec<u8>,
+    rocket::tokio::sync::oneshot::Sender<Vec<u8>>,
+);
+
+#[post("/twirp/livekit.RoomService/<method>", data = "<body>")]
+async fn room_service(
+    method: String,
+    body: rocket::data::Data<'_>,
+    requests: &State<rocket::tokio::sync::mpsc::Sender<RpcRequest>>,
+) -> Vec<u8> {
+    use rocket::data::ToByteUnit;
+    let bytes = body.open(4096.bytes()).into_bytes().await.unwrap().value;
+    let (reply, response) = rocket::tokio::sync::oneshot::channel();
+    requests.send((method, bytes, reply)).await.unwrap();
+    response.await.unwrap()
+}
+
+async fn next_rpc(requests: &mut rocket::tokio::sync::mpsc::Receiver<RpcRequest>) -> RpcRequest {
+    rocket::tokio::time::timeout(std::time::Duration::from_secs(4), requests.recv())
+        .await
+        .expect("expected a RoomService RPC")
+        .unwrap()
+}
+
+async fn verify_admin_writers(client: &Client) {
+    use livekit_protocol::{
+        DeleteRoomRequest, ListRoomsRequest, ListRoomsResponse, Room, RoomParticipantIdentity,
+    };
+    use prost::Message;
+    use revolt_config::LiveKitNode;
+    use revolt_database::voice::{
+        delete_voice_channel, is_in_voice_channel, remove_user_from_voice_channels,
+        set_channel_node, VoiceClient,
+    };
+    use rocket::{
+        fairing::AdHoc,
+        tokio::{
+            self,
+            sync::{mpsc, oneshot},
+        },
+    };
+
+    let (requests_tx, mut requests) = mpsc::channel(4);
+    let (endpoint, ready) = oneshot::channel();
+    let rocket = rocket::custom(rocket::Config {
+        port: 0,
+        log_level: rocket::config::LogLevel::Off,
+        ..rocket::Config::debug_default()
+    })
+    .manage(requests_tx)
+    .mount("/", routes![room_service])
+    .attach(AdHoc::on_liftoff("RoomService fixture", |rocket| {
+        Box::pin(async move {
+            endpoint
+                .send(format!(
+                    "http://{}:{}",
+                    rocket.config().address,
+                    rocket.config().port
+                ))
+                .unwrap();
+        })
+    }))
+    .ignite()
+    .await
+    .unwrap();
+    let shutdown = rocket.shutdown();
+    let server = tokio::spawn(rocket.launch());
+    let voice = VoiceClient::new(std::collections::HashMap::from([(
+        "node".into(),
+        LiveKitNode {
+            url: ready.await.unwrap(),
+            key: "fixture-key".into(),
+            secret: "fixture-secret".into(),
+            lat: 0.0,
+            lon: 0.0,
+            private: false,
+        },
+    )]));
+
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let channel = UserVoiceChannel {
+        id: "admin-channel".into(),
+        server_id: Some("admin-server".into()),
+    };
+    let scope = Scope::Server("admin-server".into());
+    let user = "admin-target";
+    let initiator = "admin-initiator";
+    let state = UserVoiceState {
+        id: user.into(),
+        joined_at: revolt_database::iso8601_timestamp::Timestamp::UNIX_EPOCH,
+        is_receiving: true,
+        is_publishing: true,
+        screensharing: true,
+        camera: true,
+    };
+    let old = Generation {
+        node: "node".into(),
+        room_sid: "room-old".into(),
+        participant_sid: "target-old".into(),
+        channel_id: channel.id.clone(),
+    };
+    let new = Generation {
+        room_sid: "room-new".into(),
+        participant_sid: "target-new".into(),
+        ..old.clone()
+    };
+    let replacement = Generation {
+        room_sid: "room-replacement".into(),
+        participant_sid: "target-replacement".into(),
+        ..new.clone()
+    };
+    let mut presence = Presence::new(&mut conn);
+    let initial = presence.read(user, &scope).await.unwrap();
+    presence
+        .apply(&initial, Transition::Join(&old, &state))
+        .await
+        .unwrap();
+    let initial = presence.read(initiator, &scope).await.unwrap();
+    let mut initiator_state = state.clone();
+    initiator_state.id = initiator.into();
+    let initiator_generation = Generation {
+        participant_sid: "admin".into(),
+        ..old.clone()
+    };
+    presence
+        .apply(
+            &initial,
+            Transition::Join(&initiator_generation, &initiator_state),
+        )
+        .await
+        .unwrap();
+
+    let (result, ()) = tokio::join!(remove_user_from_voice_channels(&voice, user), async {
+        let (method, body, reply) = next_rpc(&mut requests).await;
+        assert_eq!(method, "RemoveParticipant");
+        let request = RoomParticipantIdentity::decode(body.as_slice()).unwrap();
+        assert_eq!(request.room, channel.id);
+        assert_eq!(request.identity, user);
+        let pinned = presence.read(user, &scope).await.unwrap();
+        presence
+            .apply(&pinned, Transition::Join(&new, &state))
+            .await
+            .unwrap();
+        reply.send(Vec::new()).unwrap();
+    });
+    result.unwrap();
+    let current = presence.read(user, &scope).await.unwrap();
+    assert_eq!(current.generation(), Some(&new));
+    assert_eq!(current.state(), Some(&state));
+    assert!(is_in_voice_channel(initiator, &channel).await.unwrap());
+    eprintln!("Force disconnect started for OLD, RPC returned after NEW joined, Redis preserved NEW and the initiator");
+
+    let pinned = presence.read(user, &scope).await.unwrap();
+    presence
+        .set_receiving(&pinned, &channel.id, Some(false))
+        .await
+        .unwrap();
+    presence
+        .restrict_tracks(pinned, false, false)
+        .await
+        .unwrap();
+    let revoked = presence.read(user, &scope).await.unwrap();
+    let restricted = revoked.state().unwrap();
+    assert!(
+        !restricted.is_receiving
+            && !restricted.is_publishing
+            && !restricted.camera
+            && !restricted.screensharing
+    );
+    eprintln!("ACL retry used the same SID and preserved a concurrent deafen change");
+
+    set_channel_node(&channel.id, "node").await.unwrap();
+    let (result, ()) = tokio::join!(delete_voice_channel(&voice, &channel), async {
+        let (method, body, reply) = next_rpc(&mut requests).await;
+        assert_eq!(method, "ListRooms");
+        assert_eq!(
+            ListRoomsRequest::decode(body.as_slice()).unwrap().names,
+            [channel.id.as_str()]
+        );
+        reply
+            .send(
+                ListRoomsResponse {
+                    rooms: vec![Room {
+                        name: channel.id.clone(),
+                        sid: new.room_sid.clone(),
+                        ..Default::default()
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .unwrap();
+        let (method, body, reply) = next_rpc(&mut requests).await;
+        assert_eq!(method, "DeleteRoom");
+        assert_eq!(
+            DeleteRoomRequest::decode(body.as_slice()).unwrap().room,
+            channel.id
+        );
+        presence
+            .apply(&revoked, Transition::Join(&replacement, &state))
+            .await
+            .unwrap();
+        reply.send(Vec::new()).unwrap();
+    });
+    result.unwrap();
+    let current = presence.read(user, &scope).await.unwrap();
+    assert_eq!(current.generation(), Some(&replacement));
+    assert_eq!(current.state(), Some(&state));
+    assert!(is_in_voice_channel(initiator, &channel).await.unwrap());
+    eprintln!(
+        "Room cleanup used the captured SID, excluding a replacement room and other room SID"
+    );
+
+    let (result, ()) = tokio::join!(remove_user_from_voice_channels(&voice, user), async {
+        let (method, body, reply) = next_rpc(&mut requests).await;
+        assert_eq!(method, "RemoveParticipant");
+        assert_eq!(
+            RoomParticipantIdentity::decode(body.as_slice())
+                .unwrap()
+                .identity,
+            user
+        );
+        reply.send(Vec::new()).unwrap();
+    });
+    result.unwrap();
+    assert!(!is_in_voice_channel(user, &channel).await.unwrap());
+    assert!(is_in_voice_channel(initiator, &channel).await.unwrap());
+    assert!(requests.try_recv().is_err());
+    shutdown.notify();
+    server.await.unwrap().unwrap();
 }
