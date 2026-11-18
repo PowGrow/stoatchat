@@ -2,9 +2,9 @@ use revolt_config::config;
 use revolt_database::{
     util::{permissions::perms, reference::Reference},
     voice::{
-        delete_voice_state, get_channel_node, get_user_voice_channels, get_voice_channel_members,
-        raise_if_in_voice, set_call_notification_recipients, set_channel_node, UserVoiceChannel,
-        VoiceClient,
+        get_channel_node, get_voice_channel_members, raise_if_in_voice,
+        remove_user_from_voice_channels, set_call_notification_recipients, set_channel_node,
+        UserVoiceChannel, VoiceClient,
     },
     Database, User,
 };
@@ -79,19 +79,7 @@ pub async fn call(
         .clone();
 
     if force_disconnect == Some(true) {
-        // Finds and disconnects any existing voice connections by the user,
-        // should only ever loop once but just to cover our backs.
-
-        for previous_channel in get_user_voice_channels(&user.id).await? {
-            if let Some(node) = get_channel_node(&previous_channel.id).await? {
-                // if this errors its just a mismatching state - ignore and proceed to still delete our state
-                let _ = voice_client
-                    .remove_user(&node, &user.id, &previous_channel.id)
-                    .await;
-            };
-
-            delete_voice_state(&previous_channel, &user.id).await?;
-        }
+        remove_user_from_voice_channels(voice_client, &user.id).await?;
     } else {
         raise_if_in_voice(&user, &user_voice_channel).await?;
     }

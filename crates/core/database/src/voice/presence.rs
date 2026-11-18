@@ -105,6 +105,12 @@ impl Snapshot {
     pub fn state(&self) -> Option<&UserVoiceState> {
         self.active.as_ref().map(|active| &active.state)
     }
+
+    /// Returns the active generation when it belongs to this channel.
+    pub fn in_channel(&self, channel_id: &str) -> Option<&Generation> {
+        self.generation()
+            .filter(|generation| generation.channel_id == channel_id)
+    }
 }
 
 /// A Join must be confirmed against LiveKit after reading the snapshot.
@@ -171,6 +177,69 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
         })
     }
 
+    /// Reads the indexed channels of a user and validates their slots.
+    pub async fn user_channels(
+        &mut self,
+        user_id: &str,
+    ) -> RedisResult<Vec<super::UserVoiceChannel>> {
+        let index: HashMap<String, String> = cmd("HGETALL")
+            .arg(format!("{PREFIX}:user:{}", URL_SAFE_NO_PAD.encode(user_id)))
+            .query_async(self.conn)
+            .await?;
+        let mut channels = Vec::with_capacity(index.len());
+        for (scope, id) in index {
+            let scope = Scope::from_key(&scope)?;
+            if self.read(user_id, &scope).await?.in_channel(&id).is_some() {
+                channels.push(super::UserVoiceChannel {
+                    id,
+                    server_id: match scope {
+                        Scope::Server(server) => Some(server),
+                        Scope::Channel(_) => None,
+                    },
+                });
+            }
+        }
+        Ok(channels)
+    }
+
+    /// Clears the participation captured before the administrative RPC.
+    /// Retries revision conflicts only while the same generation remains active.
+    pub async fn retire(&mut self, snapshot: Snapshot) -> RedisResult<()> {
+        self.apply_to_current(snapshot, |generation, _| Transition::Leave(generation))
+            .await
+    }
+
+    async fn apply_to_current<F>(
+        &mut self,
+        mut snapshot: Snapshot,
+        transition: F,
+    ) -> RedisResult<()>
+    where
+        F: for<'b> Fn(&'b Generation, &UserVoiceState) -> Transition<'b>,
+    {
+        let Some(generation) = snapshot.generation().cloned() else {
+            return Ok(());
+        };
+        for _ in 0..3 {
+            let Some(state) = snapshot
+                .state()
+                .filter(|_| snapshot.generation() == Some(&generation))
+            else {
+                return Ok(());
+            };
+            if self
+                .apply(&snapshot, transition(&generation, state))
+                .await?
+                != ApplyOutcome::Conflict
+            {
+                return Ok(());
+            }
+            snapshot = self.read(&snapshot.user_id, &snapshot.scope).await?;
+        }
+        log::debug!("Voice presence changed during administrative update; waiting for LiveKit reconciliation");
+        Ok(())
+    }
+
     /// Reads indexed participants and ignores slots that have already moved or left.
     /// A read never edits the indexes. A consistent snapshot with a cursor requires
     /// reading the slots and event stream together.
@@ -201,8 +270,7 @@ impl<'a, C: ConnectionLike + Send> Presence<'a, C> {
         receiving: Option<bool>,
     ) -> Result<()> {
         let generation = snapshot
-            .generation()
-            .filter(|generation| generation.channel_id == channel_id)
+            .in_channel(channel_id)
             .ok_or_else(|| create_error!(NotConnected))?;
         match self
             .apply(snapshot, Transition::Receiving(generation, receiving))

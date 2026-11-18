@@ -41,17 +41,28 @@ pub async fn set_versioned_voice_receiving(
 ) -> Result<()> {
     let mut conn = get_connection().await?.into_inner();
     let mut presence = presence::Presence::new(&mut conn);
-    let scope = match &channel.server_id {
-        Some(server_id) => presence::Scope::Server(server_id.clone()),
-        None => presence::Scope::Channel(channel.id.clone()),
-    };
-    let snapshot = presence.read(user_id, &scope).await.to_internal_error()?;
+    let snapshot = presence
+        .read(user_id, &channel.scope())
+        .await
+        .to_internal_error()?;
     presence
         .set_receiving(&snapshot, &channel.id, receiving)
         .await
 }
 
 pub async fn raise_if_in_voice(user: &User, channel: &UserVoiceChannel) -> Result<()> {
+    if versioned_presence_enabled() {
+        let connected = if user.bot.is_some() {
+            is_in_voice_channel(&user.id, channel).await?
+        } else {
+            !get_user_voice_channels(&user.id).await?.is_empty()
+        };
+        return if connected {
+            Err(create_error!(AlreadyConnected))
+        } else {
+            Ok(())
+        };
+    }
     let mut conn = get_connection().await?;
 
     if user.bot.is_some() {
@@ -100,6 +111,13 @@ pub async fn delete_channel_node(channel_id: &str) -> Result<()> {
 }
 
 pub async fn get_user_voice_channels(user_id: &str) -> Result<Vec<UserVoiceChannel>> {
+    if versioned_presence_enabled() {
+        let mut conn = get_connection().await?.into_inner();
+        return presence::Presence::new(&mut conn)
+            .user_channels(user_id)
+            .await
+            .to_internal_error();
+    }
     get_connection()
         .await?
         .smembers(format!("vc:{user_id}"))
@@ -159,6 +177,11 @@ pub async fn get_user_moved_to_voice(
 }
 
 pub async fn is_in_voice_channel(user_id: &str, channel: &UserVoiceChannel) -> Result<bool> {
+    if versioned_presence_enabled() {
+        return Ok(read_current_participation(channel, user_id)
+            .await?
+            .is_some());
+    }
     get_connection()
         .await?
         .sismember(format!("vc:{user_id}"), channel)
@@ -170,11 +193,24 @@ pub async fn get_user_voice_channel_in_server(
     user_id: &str,
     server_id: &str,
 ) -> Result<Option<String>> {
-    let mut conn = get_connection().await?;
+    if versioned_presence_enabled() {
+        let mut conn = get_connection().await?.into_inner();
+        let snapshot = presence::Presence::new(&mut conn)
+            .read(user_id, &presence::Scope::Server(server_id.to_owned()))
+            .await
+            .to_internal_error()?;
+        return Ok(snapshot
+            .generation()
+            .map(|generation| generation.channel_id.clone()));
+    }
 
     let unique_key = format!("{user_id}:{server_id}");
 
-    conn.get(&unique_key).await.to_internal_error()
+    get_connection()
+        .await?
+        .get(&unique_key)
+        .await
+        .to_internal_error()
 }
 
 pub fn get_allowed_sources(
@@ -363,6 +399,14 @@ pub async fn update_voice_state(
 }
 
 pub async fn get_voice_channel_members(channel: &UserVoiceChannel) -> Result<Option<Vec<String>>> {
+    if versioned_presence_enabled() {
+        let mut conn = get_connection().await?.into_inner();
+        let states = presence::Presence::new(&mut conn)
+            .channel_states(&channel.id)
+            .await
+            .to_internal_error()?;
+        return Ok((!states.is_empty()).then(|| states.into_iter().map(|state| state.id).collect()));
+    }
     get_connection()
         .await?
         .smembers::<_, Option<Vec<String>>>(format!("vc_members:{}", &channel.id))
@@ -375,6 +419,11 @@ pub async fn get_voice_state(
     channel: &UserVoiceChannel,
     user_id: &str,
 ) -> Result<Option<UserVoiceState>> {
+    if versioned_presence_enabled() {
+        return Ok(read_current_participation(channel, user_id)
+            .await?
+            .and_then(|snapshot| snapshot.state().cloned()));
+    }
     let unique_key = format!(
         "{}:{}",
         &user_id,
@@ -641,6 +690,21 @@ pub async fn remove_user_from_voice_channel(
     channel: &UserVoiceChannel,
     user_id: &str,
 ) -> Result<()> {
+    if versioned_presence_enabled() {
+        let Some(snapshot) = read_current_participation(channel, user_id).await? else {
+            return Ok(());
+        };
+        if let Some(generation) = snapshot.generation() {
+            let _ = voice_client
+                .remove_user(&generation.node, user_id, &generation.channel_id)
+                .await;
+        }
+        let mut conn = get_connection().await?.into_inner();
+        return presence::Presence::new(&mut conn)
+            .retire(snapshot)
+            .await
+            .to_internal_error();
+    }
     if let Some(node) = get_channel_node(&channel.id).await? {
         let _ = voice_client.remove_user(&node, user_id, &channel.id).await;
     }
@@ -676,6 +740,13 @@ pub struct UserVoiceChannel {
 }
 
 impl UserVoiceChannel {
+    fn scope(&self) -> presence::Scope {
+        match &self.server_id {
+            Some(server_id) => presence::Scope::Server(server_id.clone()),
+            None => presence::Scope::Channel(self.id.clone()),
+        }
+    }
+
     pub fn from_string(input: String) -> Self {
         let mut parts = input.splitn(2, '-');
 
@@ -691,6 +762,21 @@ impl UserVoiceChannel {
             server_id: channel.server().map(ToString::to_string),
         }
     }
+}
+
+async fn read_current_participation(
+    channel: &UserVoiceChannel,
+    user_id: &str,
+) -> Result<Option<presence::Snapshot>> {
+    let mut conn = get_connection().await?.into_inner();
+    let snapshot = presence::Presence::new(&mut conn)
+        .read(user_id, &channel.scope())
+        .await
+        .to_internal_error()?;
+    Ok(snapshot
+        .in_channel(&channel.id)
+        .is_some()
+        .then_some(snapshot))
 }
 
 impl Display for UserVoiceChannel {
