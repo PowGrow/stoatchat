@@ -718,6 +718,24 @@ pub async fn delete_voice_channel(
     voice_client: &VoiceClient,
     channel: &UserVoiceChannel,
 ) -> Result<()> {
+    if versioned_presence_enabled() {
+        if let Some(node) = get_channel_node(&channel.id).await? {
+            let client = &voice_client.get_node(&node)?.client;
+            let rooms = client
+                .list_rooms(vec![channel.id.clone()])
+                .await
+                .to_internal_error()?;
+            if let Some(room) = rooms.into_iter().find(|room| room.name == channel.id) {
+                voice_client.delete_room(&node, &channel.id).await?;
+                let mut conn = get_connection().await?.into_inner();
+                presence::Presence::new(&mut conn)
+                    .finish_room(&node, &room.sid)
+                    .await
+                    .to_internal_error()?;
+            }
+        }
+        return Ok(());
+    }
     if let Some(users) = get_voice_channel_members(channel).await? {
         let node = get_channel_node(&channel.id).await?.unwrap();
         voice_client.delete_room(&node, &channel.id).await?;
