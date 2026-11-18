@@ -1,6 +1,7 @@
 use livekit_api::services::room::RoomClient;
-use livekit_protocol::{TrackInfo, TrackSource, WebhookEvent};
+use livekit_protocol::{TrackInfo, TrackSource, TrackType, WebhookEvent};
 use redis_kiss::redis::aio::ConnectionLike;
+use revolt_config::FeaturesLimits;
 use revolt_database::voice::presence::{ApplyOutcome, Presence, Scope, TrackState, Transition};
 use revolt_result::{create_error, Result, ToRevoltError};
 use rocket::tokio::time::{sleep, timeout, timeout_at, Instant};
@@ -35,6 +36,7 @@ pub async fn apply_track_webhook<C: ConnectionLike + Send>(
     scope: &Scope,
     event: &WebhookEvent,
     received_at: Instant,
+    limits: Option<&FeaturesLimits>,
 ) -> Result<()> {
     let (user_id, generation) = webhook_participation(node, event)?;
     let track = event.track.as_ref().to_internal_error()?;
@@ -67,6 +69,16 @@ pub async fn apply_track_webhook<C: ConnectionLike + Send>(
             if Instant::now() >= deadline {
                 break;
             }
+            if let Some(limits) = limits {
+                if participant.tracks.iter().any(|current| {
+                    current.sid == track.sid && track_exceeds_limits(current, limits)
+                }) {
+                    let _ = livekit
+                        .remove_participant(&generation.channel_id, user_id)
+                        .await;
+                    return presence.retire(snapshot).await.to_internal_error();
+                }
+            }
             // An unpublished SID can be absent while a replacement of the same
             // source is active. Use the complete set of current tracks.
             let tracks = publication_state(&participant.tracks);
@@ -83,6 +95,22 @@ pub async fn apply_track_webhook<C: ConnectionLike + Send>(
     })
     .await
     .unwrap_or_else(|_| Err(retry_budget_error(node, event)))
+}
+
+/// Returns whether a published track violates the configured data or video limits.
+pub fn track_exceeds_limits(track: &TrackInfo, limits: &FeaturesLimits) -> bool {
+    if track.r#type == TrackType::Data as i32 {
+        return true;
+    }
+    if track.r#type != TrackType::Video as i32 {
+        return false;
+    }
+    let [width, height] = limits.video_resolution;
+    let pixels = u64::from(track.width) * u64::from(track.height);
+    let [min_aspect, max_aspect] = limits.video_aspect_ratio;
+    (width != 0 && height != 0 && pixels > u64::from(width) * u64::from(height))
+        || (min_aspect != max_aspect
+            && !(min_aspect..=max_aspect).contains(&(track.width as f32 / track.height as f32)))
 }
 
 fn publication_state(tracks: &[TrackInfo]) -> TrackState {

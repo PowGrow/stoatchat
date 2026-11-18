@@ -3,7 +3,7 @@ mod support;
 use std::time::Duration;
 
 use livekit_api::services::room::RoomClient;
-use livekit_protocol::{ParticipantInfo, TrackInfo, TrackSource, WebhookEvent};
+use livekit_protocol::{ParticipantInfo, TrackInfo, TrackSource, TrackType, WebhookEvent};
 use redis_kiss::redis::{aio::MultiplexedConnection, cmd, streams::StreamRangeReply, Client};
 use revolt_database::voice::presence::{Generation, Presence, Scope, Transition};
 use revolt_models::v0::UserVoiceState;
@@ -12,7 +12,9 @@ use revolt_voice_ingress::{
     room_state::{apply_room_finished, apply_track_webhook},
 };
 use rocket::tokio::{self, sync::oneshot, time::Instant};
-use support::{participant, participant_lookup, room_lookup, webhook, PausedCas};
+use support::{
+    participant, participant_lookup, participant_removal, room_lookup, webhook, PausedCas,
+};
 
 const EVENTS: &str = "vp2:{voice}:events";
 
@@ -79,6 +81,7 @@ async fn receive_track(
         scope,
         event,
         Instant::now(),
+        None,
     )
     .await
     .unwrap();
@@ -224,7 +227,8 @@ async fn room_and_track_webhooks_reconcile_sid_and_publication() {
             "node",
             &scope,
             &late_mute,
-            Instant::now()
+            Instant::now(),
+            None,
         ),
         async {
             room_lookup(&mut requests, "NEW").await;
@@ -342,6 +346,53 @@ async fn room_and_track_webhooks_reconcile_sid_and_publication() {
     assert_eq!(events[3]["data"]["is_publishing"], true);
     assert_eq!(events[4]["type"], "VoiceChannelLeave");
     assert_eq!(events[4]["user"], "other");
+
+    let mut limits = revolt_config::config()
+        .await
+        .features
+        .limits
+        .default
+        .clone();
+    limits.video_resolution = [1280, 720];
+    let excessive_video = TrackInfo {
+        sid: "TR-video".into(),
+        r#type: TrackType::Video as i32,
+        source: TrackSource::Camera as i32,
+        width: 1920,
+        height: 1080,
+        ..Default::default()
+    };
+    let mut published = track_event("track_published", "NEW", "PA-new", "TR-video");
+    published.track = Some(excessive_video.clone());
+    let mut request_conn = conn.clone();
+    let mut presence = Presence::new(&mut request_conn);
+    let (outcome, ()) = tokio::join!(
+        apply_track_webhook(
+            &mut presence,
+            &livekit,
+            "node",
+            &scope,
+            &published,
+            Instant::now(),
+            Some(&limits)
+        ),
+        async {
+            room_lookup(&mut requests, "NEW").await;
+            let mut current = current_track(false);
+            current.tracks.push(excessive_video);
+            participant_lookup(&mut requests, "user")
+                .await
+                .send(Some(current))
+                .unwrap();
+            let reply = participant_removal(&mut requests, "user").await;
+            join(&mut conn, &scope, "NEW", "PA-next", "user").await;
+            reply.send(()).unwrap();
+        },
+    );
+    outcome.unwrap();
+    let replacement = presence.read("user", &scope).await.unwrap();
+    assert_eq!(replacement.generation().unwrap().participant_sid, "PA-next");
+    println!("verified oversized track triggered removal, CAS preserved replacement participation");
     assert!(requests.try_recv().is_err());
     shutdown.notify();
     server.await.unwrap().unwrap();

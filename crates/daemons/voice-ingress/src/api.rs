@@ -1,5 +1,4 @@
 use livekit_api::{access_token::TokenVerifier, webhooks::WebhookReceiver};
-use livekit_protocol::TrackType;
 use revolt_database::{
     events::client::EventV1,
     iso8601_timestamp::{Duration, Timestamp},
@@ -15,7 +14,7 @@ use revolt_database::{
 use revolt_result::{create_error, Result, ToRevoltError};
 use revolt_voice_ingress::{
     participation::apply_participant_webhook,
-    room_state::{apply_room_finished, apply_track_webhook},
+    room_state::{apply_room_finished, apply_track_webhook, track_exceeds_limits},
 };
 use rocket::{post, tokio::time::Instant, State};
 use rocket_empty::EmptyResponse;
@@ -128,8 +127,28 @@ pub async fn ingress(
                 )
                 .await?;
             } else {
-                apply_track_webhook(&mut presence, livekit, node, &scope, &event, received_at)
-                    .await?;
+                let limits = if event.event == "track_published" {
+                    let user_id = user_id.to_internal_error()?;
+                    Some(
+                        Reference::from_unchecked(user_id)
+                            .as_user(db)
+                            .await?
+                            .limits()
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                apply_track_webhook(
+                    &mut presence,
+                    livekit,
+                    node,
+                    &scope,
+                    &event,
+                    received_at,
+                    limits.as_ref(),
+                )
+                .await?;
             }
         }
         // User joined a channel
@@ -297,45 +316,14 @@ pub async fn ingress(
 
             let user_limits = user.limits().await;
 
-            // forbid any size which goes over the limit and also limit the aspect ratio to stop people from making too tall or too wide and bypassing the limit.
-            // TODO: figure out how to track audio stream quality
-
-            if event.event == "track_published" {
-                let mut disconnect = false;
-
-                if track.r#type == TrackType::Data as i32 {
-                    log::debug!("User published data");
-                    disconnect = true;
-                };
-
-                if track.r#type == TrackType::Video as i32 {
-                    if user_limits.video_resolution[0] != 0
-                        && user_limits.video_resolution[1] != 0
-                        && track.width * track.height
-                            > user_limits.video_resolution[0] * user_limits.video_resolution[1]
-                    {
-                        log::debug!("User published video with out of bounds resolution");
-                        disconnect = true;
-                    };
-
-                    if user_limits.video_aspect_ratio[0] != user_limits.video_aspect_ratio[1]
-                        && !(user_limits.video_aspect_ratio[0]..=user_limits.video_aspect_ratio[1])
-                            .contains(&(track.width as f32 / track.height as f32))
-                    {
-                        log::debug!("User published video with out of bounds aspect ratio");
-                        disconnect = true;
-                    };
-                };
-
-                if disconnect {
-                    log::debug!("Removing user {user_id} from channel {channel_id} {event:?} due to forbidden track.");
-
-                    let _ = voice_client.remove_user(node, user_id, channel_id).await;
-                    delete_voice_state(&channel, user_id).await?;
-
-                    return Ok(EmptyResponse);
-                };
-            };
+            if event.event == "track_published" && track_exceeds_limits(track, &user_limits) {
+                log::debug!(
+                    "Removing user {user_id} from channel {channel_id} due to forbidden track."
+                );
+                let _ = voice_client.remove_user(node, user_id, channel_id).await;
+                delete_voice_state(&channel, user_id).await?;
+                return Ok(EmptyResponse);
+            }
 
             let partial = update_voice_state_tracks(
                 &channel,

@@ -62,6 +62,17 @@ pub(super) enum Lookup {
         RoomParticipantIdentity,
         oneshot::Sender<Option<ParticipantInfo>>,
     ),
+    Remove(RoomParticipantIdentity, oneshot::Sender<()>),
+}
+
+#[post("/twirp/livekit.RoomService/RemoveParticipant", data = "<body>")]
+async fn remove_participant(body: Data<'_>, requests: &State<mpsc::Sender<Lookup>>) -> Vec<u8> {
+    let body = body.open(4096.bytes()).into_bytes().await.unwrap();
+    let request = RoomParticipantIdentity::decode(body.value.as_slice()).unwrap();
+    let (reply, response) = oneshot::channel();
+    requests.send(Lookup::Remove(request, reply)).await.unwrap();
+    response.await.unwrap();
+    Vec::new()
 }
 
 #[post("/twirp/livekit.RoomService/ListRooms", data = "<body>")]
@@ -158,6 +169,19 @@ pub(super) async fn participant_lookup(
     reply
 }
 
+#[allow(dead_code)] // The participant-only integration test mounts the same fixture.
+pub(super) async fn participant_removal(
+    requests: &mut mpsc::Receiver<Lookup>,
+    user: &str,
+) -> oneshot::Sender<()> {
+    let Lookup::Remove(request, reply) = next_lookup(requests).await else {
+        panic!("expected RemoveParticipant");
+    };
+    assert_eq!(request.room, "channel");
+    assert_eq!(request.identity, user);
+    reply
+}
+
 pub(super) async fn livekit() -> (
     RoomClient,
     mpsc::Receiver<Lookup>,
@@ -172,7 +196,10 @@ pub(super) async fn livekit() -> (
         ..rocket::Config::debug_default()
     })
     .manage(requests_tx)
-    .mount("/", routes![list_rooms, get_participant])
+    .mount(
+        "/",
+        routes![list_rooms, get_participant, remove_participant],
+    )
     .attach(AdHoc::on_liftoff("Mock LiveKit endpoint", |rocket| {
         Box::pin(async move {
             address_tx
